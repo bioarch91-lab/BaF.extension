@@ -43,7 +43,7 @@
 開啟「命令提示字元」執行（每台電腦做一次）：
 
 ```bash
-pyrevit extend ui BaF https://github.com/<你的帳號>/BaF.extension.git --branch=main
+pyrevit extend ui BaF https://github.com/b00204002-spec/BaF.extension.git --branch=main
 ```
 
 安裝後開啟 Revit，切到 **pyRevit** 頁籤點 **Reload**，上方就會出現「**BaF**」頁籤。
