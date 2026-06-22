@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-批次新增 / 編輯圖紙 (Batch Manage Sheets)
+圖紙編輯與管理 (Batch Manage Sheets)
 ===========================================================
-四種操作模式（Tab）：
+五種操作模式（Tab）：
   1. 編輯既有：勾選想處理的既有圖紙，輸入新的圖號/圖名（空白 = 不變更）
   2. 逐筆輸入：UI 上一行一行填寫圖號/圖名 → 新增圖紙
   3. 貼上文字：從 Excel/記事本複製貼上 → 新增圖紙
   4. 規則生成：例如 A2-{n:02d} 1~20 → 新增 20 張圖紙
+  5. Google Sheet 同步：圖紙索引與 Google Sheet 雙向同步（開發中，目前為唯讀讀取測試）
 
 「編輯既有」也支援規則式批次重新編號。
 作者: BaF / BIM 工具
@@ -123,6 +124,10 @@ class BatchManageSheetsWindow(Window):
     MODE_TABLE = 1
     MODE_PASTE = 2
     MODE_PATTERN = 3
+    MODE_SYNC = 4
+
+    # Google Sheet 同步要對照的『自訂文字參數』欄位（圖號/圖名為內建，不放這裡）
+    SYNC_TEXT_PARAMS = [u"圖紙類別", u"繪圖員", u"修正備註"]
     
     def __init__(self, title_blocks, existing_sheets):
         self.title_blocks = title_blocks
@@ -154,7 +159,7 @@ class BatchManageSheetsWindow(Window):
         return FontFamily("Consolas, Courier New, monospace")
     
     def _build_ui(self):
-        self.Title = "批次新增 / 編輯圖紙"
+        self.Title = "圖紙編輯與管理"
         self.Width = 950
         self.Height = 760
         self.WindowStartupLocation = WindowStartupLocation.CenterScreen
@@ -170,13 +175,14 @@ class BatchManageSheetsWindow(Window):
         Grid.SetRow(tb_panel, 0)
         root.Children.Add(tb_panel)
         
-        # 中間：4 個 Tab
+        # 中間：5 個 Tab
         self.tabs = TabControl()
         self.tabs.Margin = Thickness(20, 5, 20, 5)
         self.tabs.Items.Add(self._build_edit_existing_tab())
         self.tabs.Items.Add(self._build_table_tab())
         self.tabs.Items.Add(self._build_paste_tab())
         self.tabs.Items.Add(self._build_pattern_tab())
+        self.tabs.Items.Add(self._build_sync_tab())
         self.tabs.SelectedIndex = self.MODE_EDIT_EXISTING
         self.tabs.SelectionChanged += self._on_tab_changed
         Grid.SetRow(self.tabs, 1)
@@ -218,6 +224,11 @@ class BatchManageSheetsWindow(Window):
     
     def _update_run_button_label(self):
         idx = self.tabs.SelectedIndex
+        # 同步分頁用自己的唯讀按鈕，隱藏底部「執行」鈕
+        if idx == self.MODE_SYNC:
+            self.run_btn.Visibility = Visibility.Collapsed
+            return
+        self.run_btn.Visibility = Visibility.Visible
         if idx == self.MODE_EDIT_EXISTING:
             self.run_btn.Content = "套用變更"
         else:
@@ -1042,11 +1053,195 @@ class BatchManageSheetsWindow(Window):
         nums = expand_pattern(num_pat, start, end)
         names = expand_pattern(name_pat, start, end) if name_pat else [""] * len(nums)
         return list(zip(nums, names))
-    
+
+    # ---- Tab 4: Google Sheet 同步（第①步：唯讀讀取測試）----
+
+    def _build_sync_tab(self):
+        tab = TabItem()
+        tab.Header = "  Google Sheet 同步  "
+
+        outer = StackPanel()
+        outer.Orientation = Orientation.Vertical
+        outer.Margin = Thickness(20, 16, 20, 16)
+
+        hint = Border()
+        hint.Background = self._brush((232, 240, 255))
+        hint.BorderBrush = self._brush((99, 102, 241))
+        hint.BorderThickness = Thickness(1)
+        hint.CornerRadius = CornerRadius(4)
+        hint.Padding = Thickness(12, 8, 12, 8)
+        hint.Margin = Thickness(0, 0, 0, 12)
+        hint_text = TextBlock()
+        hint_text.Text = (u"第①步（目前）：讀取目前模型的圖紙索引，確認抓得到 UniqueId 與自訂參數。\n"
+                          u"此頁所有動作皆為【唯讀】，不會修改任何圖紙。\n"
+                          u"下一步將加入：圖紙索引 ⇄ Google Sheet 的雙向同步。")
+        hint_text.FontSize = 11
+        hint_text.TextWrapping = TextWrapping.Wrap
+        hint_text.Foreground = self._brush((40, 50, 80))
+        hint.Child = hint_text
+        outer.Children.Add(hint)
+
+        btn_row = StackPanel()
+        btn_row.Orientation = Orientation.Horizontal
+        btn_row.Margin = Thickness(0, 0, 0, 10)
+
+        read_btn = Button()
+        read_btn.Content = u"① 讀取目前圖紙索引"
+        read_btn.Padding = Thickness(10, 5, 10, 5)
+        read_btn.Margin = Thickness(0, 0, 8, 0)
+        read_btn.Click += self._on_read_index
+        btn_row.Children.Add(read_btn)
+
+        param_btn = Button()
+        param_btn.Content = u"列出第一張圖紙所有參數名稱"
+        param_btn.Padding = Thickness(10, 5, 10, 5)
+        param_btn.Click += self._on_list_params
+        btn_row.Children.Add(param_btn)
+
+        outer.Children.Add(btn_row)
+
+        sv = ScrollViewer()
+        sv.VerticalScrollBarVisibility = ScrollBarVisibility.Auto
+        sv.HorizontalScrollBarVisibility = ScrollBarVisibility.Auto
+        sv.Height = 470
+        sv.Background = self._brush((255, 255, 255))
+        sv.BorderBrush = self._brush((200, 205, 215))
+        sv.BorderThickness = Thickness(1)
+        self.sync_sv = sv
+        placeholder = TextBlock()
+        placeholder.Margin = Thickness(12, 12, 12, 12)
+        placeholder.Foreground = self._brush((110, 115, 130))
+        placeholder.Text = u"（按上方「① 讀取目前圖紙索引」開始）"
+        sv.Content = placeholder
+        outer.Children.Add(sv)
+
+        tab.Content = outer
+        return tab
+
+    # ---- 同步分頁：唯讀讀取邏輯 ----
+
+    def _read_text_param(self, sheet, pname):
+        """讀參數文字值。None = 此圖紙沒有這個參數；'' = 有參數但空值。"""
+        p = sheet.LookupParameter(pname)
+        if p is None:
+            return None
+        try:
+            if p.StorageType == DB.StorageType.String:
+                val = p.AsString()
+            else:
+                val = p.AsValueString()
+            return val if val is not None else u""
+        except Exception:
+            return u""
+
+    def _all_sheets_sorted(self):
+        sheets = DB.FilteredElementCollector(doc).OfClass(DB.ViewSheet).ToElements()
+        return sorted(sheets, key=lambda s: s.SheetNumber)
+
+    def _make_cell(self, text, bold=False, color=None):
+        tb = TextBlock()
+        tb.Text = text if text is not None else u""
+        tb.FontSize = 12
+        tb.Margin = Thickness(6, 2, 14, 2)
+        tb.TextTrimming = TextTrimming.CharacterEllipsis
+        if bold:
+            tb.FontWeight = FontWeights.Bold
+        tb.Foreground = self._brush(color or self.COLOR_TEXT)
+        return tb
+
+    def _build_grid_table(self, headers, rows):
+        """用 WPF Grid 排版，欄位自動對齊（不受中英文字寬影響）。"""
+        grid = Grid()
+        for _ in headers:
+            grid.ColumnDefinitions.Add(
+                ColumnDefinition(Width=GridLength(1, GridUnitType.Auto)))
+        for _ in range(len(rows) + 1):
+            grid.RowDefinitions.Add(
+                RowDefinition(Height=GridLength(1, GridUnitType.Auto)))
+        for c, h in enumerate(headers):
+            cell = self._make_cell(h, bold=True)
+            Grid.SetRow(cell, 0)
+            Grid.SetColumn(cell, c)
+            grid.Children.Add(cell)
+        for r, rowdata in enumerate(rows):
+            for c, val in enumerate(rowdata):
+                cell = self._make_cell(val)
+                Grid.SetRow(cell, r + 1)
+                Grid.SetColumn(cell, c)
+                grid.Children.Add(cell)
+        return grid
+
+    def _on_read_index(self, sender, args):
+        sheets = self._all_sheets_sorted()
+        container = StackPanel()
+        container.Margin = Thickness(10, 10, 10, 10)
+        if not sheets:
+            container.Children.Add(self._make_cell(u"（模型內沒有圖紙）"))
+            self.sync_sv.Content = container
+            return
+        params = self.SYNC_TEXT_PARAMS
+        headers = [u"UID(前8)", u"狀態", u"圖號", u"圖名"] + params
+        rows = []
+        n_place = 0
+        for s in sheets:
+            if s.IsPlaceholder:
+                n_place += 1
+                state = u"預留"
+            else:
+                state = u"真實"
+            row = [s.UniqueId[:8], state, s.SheetNumber or u"", s.Name or u""]
+            for pn in params:
+                v = self._read_text_param(s, pn)
+                if v is None:
+                    row.append(u"⚠ 無此參數")
+                else:
+                    row.append(v)  # 空值就留白
+            rows.append(row)
+        summary = self._make_cell(
+            u"共 {} 張圖紙　（真實 {} ／ 預留 {}）".format(
+                len(sheets), len(sheets) - n_place, n_place),
+            bold=True)
+        summary.Margin = Thickness(6, 2, 6, 10)
+        container.Children.Add(summary)
+        container.Children.Add(self._build_grid_table(headers, rows))
+        self.sync_sv.Content = container
+
+    def _on_list_params(self, sender, args):
+        sheets = self._all_sheets_sorted()
+        container = StackPanel()
+        container.Margin = Thickness(10, 10, 10, 10)
+        if not sheets:
+            container.Children.Add(self._make_cell(u"（模型內沒有圖紙）"))
+            self.sync_sv.Content = container
+            return
+        first = sheets[0]
+        title = self._make_cell(
+            u"第一張圖紙：{}  {}　（核對「圖紙類別/繪圖員/修正備註」的正確參數名稱）".format(
+                first.SheetNumber, first.Name),
+            bold=True)
+        title.Margin = Thickness(6, 2, 6, 10)
+        container.Children.Add(title)
+        items = []
+        for p in first.Parameters:
+            try:
+                name = p.Definition.Name
+                if p.StorageType == DB.StorageType.String:
+                    val = p.AsString()
+                else:
+                    val = p.AsValueString()
+                items.append([name, val if val else u""])
+            except Exception:
+                pass
+        items = sorted(items, key=lambda x: x[0])
+        container.Children.Add(self._build_grid_table([u"參數名稱", u"目前值"], items))
+        self.sync_sv.Content = container
+
     # ---- 執行 ----
     
     def _on_run(self, sender, args):
         idx = self.tabs.SelectedIndex
+        if idx == self.MODE_SYNC:
+            return  # 同步分頁不走這個按鈕
         if idx == self.MODE_EDIT_EXISTING:
             self._run_edit_existing()
         elif idx == self.MODE_TABLE:
