@@ -1106,8 +1106,9 @@ class BatchManageSheetsWindow(Window):
         hint.Margin = Thickness(0, 0, 0, 12)
         hint_text = TextBlock()
         hint_text.Text = (u"① 讀取：把目前模型的圖紙索引列出來（唯讀）。\n"
-                          u"② 匯出：照 Google Sheet 排版複製到剪貼簿，到試算表 A1 貼上即可。\n"
-                          u"（此頁不會修改任何 Revit 圖紙；下一步將做一鍵直接寫入 Google Sheet。）")
+                          u"② 複製到剪貼簿：照排版複製，可手動貼到試算表（備用）。\n"
+                          u"③ 匯出：一鍵把 Revit 圖紙索引寫入 Google Sheet。\n"
+                          u"（匯入：從 Google Sheet 讀回 Revit —— 開發中）")
         hint_text.FontSize = 11
         hint_text.TextWrapping = TextWrapping.Wrap
         hint_text.Foreground = self._brush((40, 50, 80))
@@ -1126,7 +1127,7 @@ class BatchManageSheetsWindow(Window):
         btn_row.Children.Add(read_btn)
 
         export_btn = Button()
-        export_btn.Content = u"② 匯出圖紙索引（複製到剪貼簿）"
+        export_btn.Content = u"② 複製到剪貼簿（備用）"
         export_btn.Padding = Thickness(10, 5, 10, 5)
         export_btn.Margin = Thickness(0, 0, 8, 0)
         export_btn.Click += self._on_export_clipboard
@@ -1167,7 +1168,7 @@ class BatchManageSheetsWindow(Window):
         cfg_panel.Children.Add(self.gs_tab_box)
 
         write_btn = Button()
-        write_btn.Content = u"③ 一鍵寫入 Google Sheet"
+        write_btn.Content = u"③ 匯出（寫入 Google Sheet）"
         write_btn.Padding = Thickness(12, 6, 12, 6)
         write_btn.HorizontalAlignment = HorizontalAlignment.Left
         write_btn.Background = self._brush(self.COLOR_PRIMARY)
