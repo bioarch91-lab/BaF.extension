@@ -19,6 +19,7 @@ clr.AddReference("PresentationCore")
 clr.AddReference("PresentationFramework")
 clr.AddReference("WindowsBase")
 clr.AddReference("System.Xaml")
+clr.AddReference("System")
 
 from System import DateTime
 
@@ -36,8 +37,34 @@ from System.Windows.Media import SolidColorBrush, Color, FontFamily
 
 from pyrevit import revit, DB, forms, script
 
+import os
+import json
+
 doc = revit.doc
 output = script.get_output()
+
+# Google Sheet 寫入設定（存在本機，不進 git，避免 URL 外流）
+GSHEET_CFG = os.path.join(os.getenv("APPDATA") or u"", "pyRevit", "baf_gsheet_config.json")
+
+
+def load_gsheet_cfg():
+    try:
+        with open(GSHEET_CFG, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_gsheet_cfg(cfg):
+    try:
+        d = os.path.dirname(GSHEET_CFG)
+        if d and not os.path.exists(d):
+            os.makedirs(d)
+        with open(GSHEET_CFG, "w") as f:
+            json.dump(cfg, f)
+        return True
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -1109,6 +1136,45 @@ class BatchManageSheetsWindow(Window):
 
         outer.Children.Add(btn_row)
 
+        # ③ 寫入 Google Sheet 設定區
+        cfg = load_gsheet_cfg()
+        cfg_box = Border()
+        cfg_box.Background = self._brush((245, 247, 250))
+        cfg_box.BorderBrush = self._brush((210, 215, 225))
+        cfg_box.BorderThickness = Thickness(1)
+        cfg_box.CornerRadius = CornerRadius(4)
+        cfg_box.Padding = Thickness(12, 8, 12, 10)
+        cfg_box.Margin = Thickness(0, 0, 0, 10)
+        cfg_panel = StackPanel()
+        cfg_panel.Orientation = Orientation.Vertical
+
+        cfg_panel.Children.Add(self._make_label(u"Web App URL（/exec 結尾）"))
+        self.gs_url_box = TextBox()
+        self.gs_url_box.Padding = Thickness(4, 4, 4, 4)
+        self.gs_url_box.Margin = Thickness(0, 0, 0, 8)
+        self.gs_url_box.Text = cfg.get("url", u"")
+        cfg_panel.Children.Add(self.gs_url_box)
+
+        cfg_panel.Children.Add(self._make_label(u"目標頁籤名稱"))
+        self.gs_tab_box = TextBox()
+        self.gs_tab_box.Padding = Thickness(4, 4, 4, 4)
+        self.gs_tab_box.Margin = Thickness(0, 0, 0, 10)
+        self.gs_tab_box.Text = cfg.get("tab", u"")
+        cfg_panel.Children.Add(self.gs_tab_box)
+
+        write_btn = Button()
+        write_btn.Content = u"③ 一鍵寫入 Google Sheet"
+        write_btn.Padding = Thickness(12, 6, 12, 6)
+        write_btn.HorizontalAlignment = HorizontalAlignment.Left
+        write_btn.Background = self._brush(self.COLOR_PRIMARY)
+        write_btn.Foreground = self._brush(self.COLOR_TEXT_LIGHT)
+        write_btn.FontWeight = FontWeights.Bold
+        write_btn.Click += self._on_write_gsheet
+        cfg_panel.Children.Add(write_btn)
+
+        cfg_box.Child = cfg_panel
+        outer.Children.Add(cfg_box)
+
         sv = ScrollViewer()
         sv.VerticalScrollBarVisibility = ScrollBarVisibility.Auto
         sv.HorizontalScrollBarVisibility = ScrollBarVisibility.Auto
@@ -1309,6 +1375,73 @@ class BatchManageSheetsWindow(Window):
         if len(rows) >= 2:
             container.Children.Add(self._build_grid_table(rows[1], rows[2:]))
         self.sync_sv.Content = container
+
+    # ---- 同步分頁：③ 一鍵寫入 Google Sheet ----
+
+    def _show_sync_msg(self, text, color):
+        container = StackPanel()
+        container.Margin = Thickness(10, 10, 10, 10)
+        cell = self._make_cell(text, bold=True, color=color)
+        cell.TextWrapping = TextWrapping.Wrap
+        container.Children.Add(cell)
+        self.sync_sv.Content = container
+
+    def _on_write_gsheet(self, sender, args):
+        url = (self.gs_url_box.Text or u"").strip()
+        tab = (self.gs_tab_box.Text or u"").strip()
+        if not url:
+            forms.alert(u"請先貼上 Web App URL。")
+            return
+        if not tab:
+            forms.alert(u"請填寫目標頁籤名稱。")
+            return
+
+        rows, n = self._build_export_rows()
+        ok = forms.alert(
+            u"即將把 {} 張圖紙寫入 Google Sheet。\n\n"
+            u"頁籤：{}\n"
+            u"注意：會覆蓋該頁籤 A~H 欄的現有內容。\n\n要繼續嗎？".format(n, tab),
+            yes=True, no=True)
+        if not ok:
+            return
+
+        save_gsheet_cfg({"url": url, "tab": tab, "secret": u""})
+
+        payload = {"secret": u"", "tab": tab, "rows": rows}
+        body = json.dumps(payload)  # ensure_ascii -> 純 ASCII，中文以 \u 編碼
+
+        try:
+            from System.Net import (WebClient, ServicePointManager,
+                                    SecurityProtocolType)
+            from System.Text import Encoding
+            ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12
+            wc = WebClient()
+            wc.Encoding = Encoding.UTF8
+            wc.Headers.Add("Content-Type", "application/json")
+            resp = wc.UploadString(url, "POST", body)
+        except Exception as ex:
+            self._show_sync_msg(u"❌ 連線失敗：{}".format(ex), self.COLOR_ERROR)
+            return
+
+        try:
+            result = json.loads(resp)
+        except Exception:
+            result = None
+
+        if result and result.get("ok"):
+            note = result.get("note") or u""
+            msg = (u"✅ 寫入完成！\n"
+                   u"收到 {} 列、寫入 {} 列到頁籤「{}」。\n"
+                   u"（含更新時間列＋表頭，所以資料張數 = 列數 - 2）\n"
+                   u"回到 Google Sheet 看看 —— 核取方塊、下拉都會自動套好，D 欄紅色三角也會消失。").format(
+                       result.get("received", u"?"), result.get("wrote", u"?"),
+                       result.get("tab", tab))
+            if note:
+                msg += u"\n\n⚠ 部分附加設定有狀況：{}".format(note)
+            self._show_sync_msg(msg, self.COLOR_SUCCESS)
+        else:
+            err = result.get("error") if result else resp
+            self._show_sync_msg(u"❌ 寫入失敗：{}".format(err), self.COLOR_ERROR)
 
     # ---- 執行 ----
     
