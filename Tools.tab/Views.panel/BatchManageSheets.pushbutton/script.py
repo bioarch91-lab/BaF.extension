@@ -20,10 +20,12 @@ clr.AddReference("PresentationFramework")
 clr.AddReference("WindowsBase")
 clr.AddReference("System.Xaml")
 
+from System import DateTime
+
 from System.Windows import (
     Window, Thickness, HorizontalAlignment, VerticalAlignment,
     WindowStartupLocation, Visibility, TextTrimming, FontWeights,
-    GridLength, GridUnitType, CornerRadius, TextWrapping
+    GridLength, GridUnitType, CornerRadius, TextWrapping, Clipboard
 )
 from System.Windows.Controls import (
     StackPanel, Button, ScrollViewer, Grid, RowDefinition, ColumnDefinition,
@@ -1072,9 +1074,9 @@ class BatchManageSheetsWindow(Window):
         hint.Padding = Thickness(12, 8, 12, 8)
         hint.Margin = Thickness(0, 0, 0, 12)
         hint_text = TextBlock()
-        hint_text.Text = (u"第①步（目前）：讀取目前模型的圖紙索引，確認抓得到 UniqueId 與自訂參數。\n"
-                          u"此頁所有動作皆為【唯讀】，不會修改任何圖紙。\n"
-                          u"下一步將加入：圖紙索引 ⇄ Google Sheet 的雙向同步。")
+        hint_text.Text = (u"① 讀取：把目前模型的圖紙索引列出來（唯讀）。\n"
+                          u"② 匯出：照 Google Sheet 排版複製到剪貼簿，到試算表 A1 貼上即可。\n"
+                          u"（此頁不會修改任何 Revit 圖紙；下一步將做一鍵直接寫入 Google Sheet。）")
         hint_text.FontSize = 11
         hint_text.TextWrapping = TextWrapping.Wrap
         hint_text.Foreground = self._brush((40, 50, 80))
@@ -1091,6 +1093,13 @@ class BatchManageSheetsWindow(Window):
         read_btn.Margin = Thickness(0, 0, 8, 0)
         read_btn.Click += self._on_read_index
         btn_row.Children.Add(read_btn)
+
+        export_btn = Button()
+        export_btn.Content = u"② 匯出圖紙索引（複製到剪貼簿）"
+        export_btn.Padding = Thickness(10, 5, 10, 5)
+        export_btn.Margin = Thickness(0, 0, 8, 0)
+        export_btn.Click += self._on_export_clipboard
+        btn_row.Children.Add(export_btn)
 
         param_btn = Button()
         param_btn.Content = u"列出第一張圖紙所有參數名稱"
@@ -1234,6 +1243,71 @@ class BatchManageSheetsWindow(Window):
                 pass
         items = sorted(items, key=lambda x: x[0])
         container.Children.Add(self._build_grid_table([u"參數名稱", u"目前值"], items))
+        self.sync_sv.Content = container
+
+    # ---- 同步分頁：匯出（Revit → 剪貼簿，照 Google Sheet 排版）----
+
+    @staticmethod
+    def _clean_cell(x):
+        """去掉會破壞 TSV 欄位的 tab/換行。"""
+        s = u"" if x is None else unicode(x)
+        return s.replace(u"\t", u" ").replace(u"\r", u" ").replace(u"\n", u" ")
+
+    def _build_export_rows(self):
+        """回傳 (二維字串陣列, 圖紙數)。欄位順序: A空 B:UID C:狀態 D:類別 E:圖號 F:圖名 G:繪圖員 H:備註"""
+        sheets = self._all_sheets_sorted()
+        date_str = DateTime.Now.ToString("yyyyMMdd")
+
+        rows = []
+        # 第1列：更新時間（日期放 E 欄）
+        rows.append([u"", u"更新時間：", u"", u"", date_str, u"", u"", u""])
+        # 第2列：表頭
+        rows.append([u"", u"UID", u"狀態", u"圖紙類別", u"圖紙號碼",
+                     u"圖紙名稱", u"繪圖員", u"修正備註"])
+        # 第3列起：資料
+        for s in sheets:
+            cat = self._read_text_param(s, u"圖紙類別")
+            drawer = self._read_text_param(s, u"繪圖員")
+            note = self._read_text_param(s, u"修正備註")
+            row = [
+                u"",                                       # A 空白（保留擴充）
+                s.UniqueId,                                # B 完整 UniqueId（主鍵）
+                u"FALSE" if s.IsPlaceholder else u"TRUE",   # C 狀態（核取方塊：勾=真實）
+                cat if cat else u"",                       # D 圖紙類別（下拉）
+                s.SheetNumber or u"",                      # E 圖紙號碼
+                s.Name or u"",                             # F 圖紙名稱
+                drawer if drawer else u"",                 # G 繪圖員（下拉）
+                note if note else u"",                     # H 修正備註
+            ]
+            rows.append([self._clean_cell(x) for x in row])
+        return rows, len(sheets)
+
+    def _on_export_clipboard(self, sender, args):
+        rows, n = self._build_export_rows()
+        tsv = u"\r\n".join(u"\t".join(r) for r in rows)
+
+        ok = True
+        err = u""
+        try:
+            Clipboard.SetText(tsv)
+        except Exception as ex:
+            ok = False
+            err = str(ex)
+
+        container = StackPanel()
+        container.Margin = Thickness(10, 10, 10, 10)
+        if ok:
+            msg = (u"✅ 已複製 {} 張圖紙到剪貼簿（含更新時間列與表頭）。\n"
+                   u"請到 Google Sheet 的 A1 儲存格貼上 → 檢查下拉選單與核取方塊有沒有吃進去。").format(n)
+            head = self._make_cell(msg, bold=True, color=self.COLOR_SUCCESS)
+        else:
+            head = self._make_cell(u"❌ 複製失敗：{}".format(err), bold=True, color=self.COLOR_ERROR)
+        head.Margin = Thickness(6, 2, 6, 10)
+        container.Children.Add(head)
+
+        # 預覽：用第2列(表頭)＋資料列做表格
+        if len(rows) >= 2:
+            container.Children.Add(self._build_grid_table(rows[1], rows[2:]))
         self.sync_sv.Content = container
 
     # ---- 執行 ----
