@@ -33,6 +33,13 @@ function doPost(e) {
     const labels = body.headerLabels || [];
     const records = body.records || [];
     if (!labels.length) return json({ ok: false, error: '缺 headerLabels' });
+    const checkboxLabel = body.checkboxLabel || '是否為Revit出圖';
+    const dropdownLabels = body.dropdownLabels || ['圖紙類別', '繪圖員'];
+
+    // 讀取模式（匯入用）：回傳目前頁籤的資料，不做任何修改
+    if (body.action === 'read') {
+      return json(readSheet(sh, labels));
+    }
 
     // 0) 移除篩選器
     try { if (sh.getFilter()) sh.getFilter().remove(); } catch (e0) {}
@@ -97,12 +104,19 @@ function doPost(e) {
     let note = '';
     if (missing.length) note += '找不到表頭: ' + missing.join('/') + '; ';
     if (nData > 0) {
-      const cStatus = colOf['狀態'];
+      const cStatus = colOf[checkboxLabel];
       if (cStatus) {
-        try { sh.getRange(dataStart, cStatus, nData, 1).insertCheckboxes(); }
-        catch (e2) { note += '核取方塊失敗:' + e2 + '; '; }
+        try {
+          const cRange = sh.getRange(dataStart, cStatus, nData, 1);
+          cRange.insertCheckboxes();
+          // 強制寫成真正的布林值，核取方塊才會打勾/取消
+          cRange.setValues(records.map(function (rec) {
+            const v = rec[checkboxLabel];
+            return [v === true || String(v).toUpperCase() === 'TRUE'];
+          }));
+        } catch (e2) { note += '核取方塊失敗:' + e2 + '; '; }
       }
-      ['圖紙類別', '繪圖員'].forEach(function (l) {
+      dropdownLabels.forEach(function (l) {
         const c = colOf[l];
         if (!c) return;
         try {
@@ -131,7 +145,11 @@ function doPost(e) {
       catch (e5) { note += '鎖表頭失敗:' + e5 + '; '; }
     }
 
-    return json({ ok: true, tab: tabName, headerRow: headerRow, wrote: nData, locked: locked, note: note });
+    return json({
+      ok: true, apiVersion: 'v4', tab: tabName, headerRow: headerRow,
+      wrote: nData, checkboxCol: (colOf[checkboxLabel] || 0),
+      checkboxLabel: checkboxLabel, locked: locked, note: note
+    });
   } catch (err) {
     return json({ ok: false, error: String(err) });
   }
@@ -172,6 +190,44 @@ function lockHeaderRows(sh, headerRow, lastCol) {
   } catch (ee) {}
   try { if (p.canDomainEdit && p.canDomainEdit()) p.setDomainEdit(false); } catch (ee2) {}
   return true;
+}
+
+function readSheet(sh, labels) {
+  const scan = Math.min(10, sh.getMaxRows());
+  const lastCol = Math.max(sh.getLastColumn(), 8);
+  let headerRow = 0, bestHit = 0, headerVals = null;
+  for (let r = 1; r <= scan; r++) {
+    const vals = sh.getRange(r, 1, 1, lastCol).getValues()[0];
+    let hit = 0;
+    for (let c = 0; c < vals.length; c++) if (labels.indexOf(String(vals[c]).trim()) >= 0) hit++;
+    if (hit > bestHit) { bestHit = hit; headerRow = r; headerVals = vals; }
+  }
+  if (!headerRow) return { ok: false, error: '找不到表頭列' };
+  const colOf = {};
+  for (let c = 0; c < headerVals.length; c++) {
+    const t = String(headerVals[c]).trim();
+    if (t && colOf[t] === undefined && labels.indexOf(t) >= 0) colOf[t] = c + 1;
+  }
+  const dataStart = headerRow + 1;
+  const lastRow = sh.getLastRow();
+  const records = [];
+  const n = lastRow - dataStart + 1;
+  if (n > 0) {
+    const block = sh.getRange(dataStart, 1, n, lastCol).getValues();
+    block.forEach(function (row) {
+      const rec = {};
+      labels.forEach(function (l) {
+        const c = colOf[l];
+        rec[l] = c ? row[c - 1] : '';
+      });
+      // 略過整列空白（沒有 UID / 圖號 / 圖名）
+      const u = String(rec['UID'] || '').trim();
+      const num = String(rec['圖紙號碼'] || '').trim();
+      const nm = String(rec['圖紙名稱'] || '').trim();
+      if (u || num || nm) records.push(rec);
+    });
+  }
+  return { ok: true, headerRow: headerRow, records: records };
 }
 
 function json(obj) {

@@ -159,8 +159,10 @@ class BatchManageSheetsWindow(Window):
     SYNC_TEXT_PARAMS = [u"圖紙類別", u"繪圖員", u"修正備註"]
 
     # 寫入 Google Sheet 用的表頭名稱（程式會去試算表找同名的欄，可自由調換欄位順序）
-    HEADER_LABELS = [u"UID", u"狀態", u"圖紙類別", u"圖紙號碼",
+    HEADER_LABELS = [u"UID", u"是否為Revit出圖", u"圖紙類別", u"圖紙號碼",
                      u"圖紙名稱", u"繪圖員", u"修正備註"]
+    CHECKBOX_LABEL = u"是否為Revit出圖"          # 這欄在 Google Sheet 套核取方塊
+    DROPDOWN_LABELS = [u"圖紙類別", u"繪圖員"]    # 這些欄套下拉選單
     
     def __init__(self, title_blocks, existing_sheets):
         self.title_blocks = title_blocks
@@ -1093,9 +1095,12 @@ class BatchManageSheetsWindow(Window):
         tab = TabItem()
         tab.Header = "  Google Sheet 同步  "
 
-        outer = StackPanel()
-        outer.Orientation = Orientation.Vertical
+        outer = Grid()
         outer.Margin = Thickness(20, 16, 20, 16)
+        outer.RowDefinitions.Add(RowDefinition(Height=GridLength(1, GridUnitType.Auto)))  # 說明
+        outer.RowDefinitions.Add(RowDefinition(Height=GridLength(1, GridUnitType.Auto)))  # 讀取按鈕列
+        outer.RowDefinitions.Add(RowDefinition(Height=GridLength(1, GridUnitType.Auto)))  # 設定/匯出匯入
+        outer.RowDefinitions.Add(RowDefinition(Height=GridLength(1, GridUnitType.Star)))  # 結果(填滿剩餘)
 
         hint = Border()
         hint.Background = self._brush((232, 240, 255))
@@ -1113,6 +1118,7 @@ class BatchManageSheetsWindow(Window):
         hint_text.TextWrapping = TextWrapping.Wrap
         hint_text.Foreground = self._brush((40, 50, 80))
         hint.Child = hint_text
+        Grid.SetRow(hint, 0)
         outer.Children.Add(hint)
 
         btn_row = StackPanel()
@@ -1139,6 +1145,7 @@ class BatchManageSheetsWindow(Window):
         param_btn.Click += self._on_list_params
         btn_row.Children.Add(param_btn)
 
+        Grid.SetRow(btn_row, 1)
         outer.Children.Add(btn_row)
 
         # ③ 寫入 Google Sheet 設定區
@@ -1167,23 +1174,45 @@ class BatchManageSheetsWindow(Window):
         self.gs_tab_box.Text = cfg.get("tab", u"")
         cfg_panel.Children.Add(self.gs_tab_box)
 
+        wbtn_row = StackPanel()
+        wbtn_row.Orientation = Orientation.Horizontal
+
         write_btn = Button()
         write_btn.Content = u"③ 匯出（寫入 Google Sheet）"
         write_btn.Padding = Thickness(12, 6, 12, 6)
-        write_btn.HorizontalAlignment = HorizontalAlignment.Left
+        write_btn.Margin = Thickness(0, 0, 8, 0)
         write_btn.Background = self._brush(self.COLOR_PRIMARY)
         write_btn.Foreground = self._brush(self.COLOR_TEXT_LIGHT)
         write_btn.FontWeight = FontWeights.Bold
         write_btn.Click += self._on_write_gsheet
-        cfg_panel.Children.Add(write_btn)
+        wbtn_row.Children.Add(write_btn)
+
+        import_btn = Button()
+        import_btn.Content = u"④ 匯入（預覽差異）"
+        import_btn.Padding = Thickness(12, 6, 12, 6)
+        import_btn.Margin = Thickness(0, 0, 8, 0)
+        import_btn.FontWeight = FontWeights.Bold
+        import_btn.Click += self._on_import_preview
+        wbtn_row.Children.Add(import_btn)
+
+        apply_btn = Button()
+        apply_btn.Content = u"⑤ 套用匯入（改 Revit）"
+        apply_btn.Padding = Thickness(12, 6, 12, 6)
+        apply_btn.FontWeight = FontWeights.Bold
+        apply_btn.Background = self._brush((217, 119, 6))
+        apply_btn.Foreground = self._brush(self.COLOR_TEXT_LIGHT)
+        apply_btn.Click += self._on_import_apply
+        wbtn_row.Children.Add(apply_btn)
+
+        cfg_panel.Children.Add(wbtn_row)
 
         cfg_box.Child = cfg_panel
+        Grid.SetRow(cfg_box, 2)
         outer.Children.Add(cfg_box)
 
         sv = ScrollViewer()
         sv.VerticalScrollBarVisibility = ScrollBarVisibility.Auto
         sv.HorizontalScrollBarVisibility = ScrollBarVisibility.Auto
-        sv.Height = 470
         sv.Background = self._brush((255, 255, 255))
         sv.BorderBrush = self._brush((200, 205, 215))
         sv.BorderThickness = Thickness(1)
@@ -1193,6 +1222,7 @@ class BatchManageSheetsWindow(Window):
         placeholder.Foreground = self._brush((110, 115, 130))
         placeholder.Text = u"（按上方「① 讀取目前圖紙索引」開始）"
         sv.Content = placeholder
+        Grid.SetRow(sv, 3)
         outer.Children.Add(sv)
 
         tab.Content = outer
@@ -1216,7 +1246,12 @@ class BatchManageSheetsWindow(Window):
 
     def _all_sheets_sorted(self):
         sheets = DB.FilteredElementCollector(doc).OfClass(DB.ViewSheet).ToElements()
-        return sorted(sheets, key=lambda s: s.SheetNumber)
+
+        # 依 Revit 明細表的編排原則：先分組(圖紙類別)再依圖號排序
+        def _key(s):
+            cat = self._read_text_param(s, u"圖紙類別") or u""
+            return (cat, s.SheetNumber or u"")
+        return sorted(sheets, key=_key)
 
     def _make_cell(self, text, bold=False, color=None):
         tb = TextBlock()
@@ -1333,7 +1368,7 @@ class BatchManageSheetsWindow(Window):
         # 第1列：更新時間（日期放 E 欄）
         rows.append([u"", u"更新時間：", u"", u"", date_str, u"", u"", u""])
         # 第2列：表頭
-        rows.append([u"", u"UID", u"狀態", u"圖紙類別", u"圖紙號碼",
+        rows.append([u"", u"UID", u"是否為Revit出圖", u"圖紙類別", u"圖紙號碼",
                      u"圖紙名稱", u"繪圖員", u"修正備註"])
         # 第3列起：資料
         for s in sheets:
@@ -1398,7 +1433,7 @@ class BatchManageSheetsWindow(Window):
         for s in sheets:
             recs.append({
                 u"UID": s.UniqueId,
-                u"狀態": (not s.IsPlaceholder),          # True=真實(打勾), False=預留
+                u"是否為Revit出圖": (not s.IsPlaceholder),   # True=Revit出圖(真實), False=CAD(預留)
                 u"圖紙類別": self._read_text_param(s, u"圖紙類別") or u"",
                 u"圖紙號碼": s.SheetNumber or u"",
                 u"圖紙名稱": s.Name or u"",
@@ -1406,6 +1441,22 @@ class BatchManageSheetsWindow(Window):
                 u"修正備註": self._read_text_param(s, u"修正備註") or u"",
             })
         return recs, len(sheets)
+
+    def _do_export(self, url, tab):
+        """不經 UI 的匯出（給套用後自動回寫）。回傳 (result, err, 張數)。"""
+        recs, n = self._build_export_records()
+        payload = {
+            "secret": u"",
+            "tab": tab,
+            "headerLabels": self.HEADER_LABELS,
+            "checkboxLabel": self.CHECKBOX_LABEL,
+            "dropdownLabels": self.DROPDOWN_LABELS,
+            "records": recs,
+            "updateDate": DateTime.Now.ToString("yyyyMMdd"),
+            "lockHeader": True,
+        }
+        result, err = self._post_json(url, payload)
+        return result, err, n
 
     def _on_write_gsheet(self, sender, args):
         url = (self.gs_url_box.Text or u"").strip()
@@ -1432,6 +1483,8 @@ class BatchManageSheetsWindow(Window):
             "secret": u"",
             "tab": tab,
             "headerLabels": self.HEADER_LABELS,
+            "checkboxLabel": self.CHECKBOX_LABEL,
+            "dropdownLabels": self.DROPDOWN_LABELS,
             "records": recs,
             "updateDate": DateTime.Now.ToString("yyyyMMdd"),
             "lockHeader": True,
@@ -1458,19 +1511,379 @@ class BatchManageSheetsWindow(Window):
 
         if result and result.get("ok"):
             note = result.get("note") or u""
-            msg = (u"✅ 寫入完成！\n"
-                   u"表頭在第 {} 列，寫入 {} 張圖紙到頁籤「{}」。\n"
+            ver = result.get("apiVersion") or u"舊版(請重新部署新版本!)"
+            cbcol = result.get("checkboxCol")
+            cbinfo = (u"核取方塊欄=第 {} 欄".format(cbcol) if cbcol
+                      else u"⚠ 找不到核取方塊欄『{}』(表頭名稱要一致)".format(
+                          result.get("checkboxLabel", self.CHECKBOX_LABEL)))
+            msg = (u"✅ 寫入完成！　Google端程式版本：{}\n"
+                   u"表頭在第 {} 列，寫入 {} 張圖紙到「{}」。{}\n"
                    u"{}\n"
-                   u"回到 Google Sheet 看看 —— 欄位依表頭名稱對位，核取方塊/下拉都自動套好。").format(
-                       result.get("headerRow", u"?"), result.get("wrote", u"?"),
-                       result.get("tab", tab),
-                       u"🔒 表頭已鎖定（只有試算表擁有者能改）。" if result.get("locked") else u"")
+                   u"回到 Google Sheet 看看核取方塊/下拉。").format(
+                       ver, result.get("headerRow", u"?"), result.get("wrote", u"?"),
+                       result.get("tab", tab), cbinfo,
+                       u"🔒 表頭已鎖定（只有擁有者能改）。" if result.get("locked") else u"")
             if note:
                 msg += u"\n\n⚠ 備註：{}".format(note)
             self._show_sync_msg(msg, self.COLOR_SUCCESS)
         else:
             err = result.get("error") if result else resp
             self._show_sync_msg(u"❌ 寫入失敗：{}".format(err), self.COLOR_ERROR)
+
+    # ---- 同步分頁：④ 匯入（從 Google Sheet 讀回 + 預覽差異，唯讀不套用）----
+
+    def _post_json(self, url, payload):
+        """POST JSON，回傳 (dict 或 None, 錯誤字串 或 None)。"""
+        body = json.dumps(payload)
+        try:
+            from System.Net import (WebClient, ServicePointManager,
+                                    SecurityProtocolType)
+            from System.Text import Encoding
+            ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12
+            wc = WebClient()
+            wc.Encoding = Encoding.UTF8
+            wc.Headers.Add("Content-Type", "application/json")
+            resp = wc.UploadString(url, "POST", body)
+        except Exception as ex:
+            return None, u"連線失敗：{}".format(ex)
+        try:
+            return json.loads(resp), None
+        except Exception:
+            return None, u"回應解析失敗：{}".format(resp)
+
+    @staticmethod
+    def _truthy(v):
+        if v is True:
+            return True
+        if v is False or v is None:
+            return False
+        return unicode(v).strip().upper() in (u"TRUE", u"1", u"V", u"X", u"是", u"YES")
+
+    def _on_import_preview(self, sender, args):
+        url = (self.gs_url_box.Text or u"").strip()
+        tab = (self.gs_tab_box.Text or u"").strip()
+        if not url or not tab:
+            forms.alert(u"請先填 Web App URL 與目標頁籤名稱。")
+            return
+        save_gsheet_cfg({"url": url, "tab": tab, "secret": u""})
+        payload = {"secret": u"", "tab": tab, "action": "read",
+                   "headerLabels": self.HEADER_LABELS}
+        result, err = self._post_json(url, payload)
+        if err:
+            self._show_sync_msg(u"❌ {}".format(err), self.COLOR_ERROR)
+            return
+        if not (result and result.get("ok")):
+            self._show_sync_msg(
+                u"❌ 讀取失敗：{}".format(result.get("error") if result else u"無回應"),
+                self.COLOR_ERROR)
+            return
+        records = result.get("records") or []
+        self._show_diff(records, self._compute_diff(records))
+
+    def _compute_diff(self, records):
+        by_uid = {}
+        for s in DB.FilteredElementCollector(doc).OfClass(DB.ViewSheet).ToElements():
+            by_uid[s.UniqueId] = s
+        seen = set()
+        rows = []
+        counts = {"new": 0, "edit": 0, "toReal": 0, "toPlace": 0,
+                  "orphan": 0, "same": 0}
+        for rec in records:
+            uid = unicode(rec.get(u"UID") or u"").strip()
+            num = unicode(rec.get(u"圖紙號碼") or u"")
+            nm = unicode(rec.get(u"圖紙名稱") or u"")
+            want_real = self._truthy(rec.get(u"是否為Revit出圖"))
+            if not uid:
+                counts["new"] += 1
+                rows.append((u"🆕 新增" + (u"(真實)" if want_real else u"(預留)"),
+                             num, nm, u""))
+                continue
+            seen.add(uid)
+            s = by_uid.get(uid)
+            if s is None:
+                counts["orphan"] += 1
+                rows.append((u"⛔ 找不到對應", num, nm, u"此 UID 在 Revit 不存在"))
+                continue
+            detail = []
+            cur_num = s.SheetNumber or u""
+            cur_nm = s.Name or u""
+            if num and num != cur_num:
+                detail.append(u"圖號 {}→{}".format(cur_num, num))
+            if nm and nm != cur_nm:
+                detail.append(u"圖名 {}→{}".format(cur_nm, nm))
+            for label in (u"圖紙類別", u"繪圖員", u"修正備註"):
+                newv = unicode(rec.get(label) or u"")
+                curv = self._read_text_param(s, label)
+                curv = curv if curv is not None else u""
+                if newv != curv:
+                    detail.append(u"{} {}→{}".format(label, curv or u"空", newv or u"空"))
+            if want_real and s.IsPlaceholder:
+                counts["toReal"] += 1
+                act = u"⬆️ 轉真實圖紙"
+            elif (not want_real) and (not s.IsPlaceholder):
+                counts["toPlace"] += 1
+                act = u"⚠️ 真實→預留(需刪除重建)"
+            elif detail:
+                counts["edit"] += 1
+                act = u"✏️ 修改"
+            else:
+                counts["same"] += 1
+                act = u"＝ 無變更"
+            rows.append((act, num or cur_num, nm or cur_nm, u"; ".join(detail)))
+        revit_only = [s for uid, s in by_uid.items() if uid not in seen]
+        return rows, counts, revit_only
+
+    def _show_diff(self, records, diff):
+        rows, counts, revit_only = diff
+        container = StackPanel()
+        container.Margin = Thickness(10, 10, 10, 10)
+        summary = self._make_cell(
+            u"差異預覽（唯讀，尚未套用任何變更）\n"
+            u"Google Sheet 共 {} 筆　→　新增 {}／修改 {}／轉真實 {}／降預留刪除 {}／"
+            u"找不到對應 {}／無變更 {}\n"
+            u"刪除(Sheet 已移除)：{} 張（按⑤套用時會列清單再確認）".format(
+                len(records), counts["new"], counts["edit"], counts["toReal"],
+                counts["toPlace"], counts["orphan"], counts["same"], len(revit_only)),
+            bold=True)
+        summary.TextWrapping = TextWrapping.Wrap
+        summary.Margin = Thickness(6, 2, 6, 10)
+        container.Children.Add(summary)
+
+        changed = [[r[0], r[1], r[2], r[3]] for r in rows
+                   if not r[0].startswith(u"＝")]
+        for s in revit_only:
+            changed.append([u"🗑️ 刪除(Sheet已移除)", s.SheetNumber or u"",
+                            s.Name or u"", u"此圖在 Google Sheet 已被刪除"])
+        if not changed:
+            container.Children.Add(
+                self._make_cell(u"✅ 沒有差異，Revit 與 Google Sheet 一致。",
+                                bold=True, color=self.COLOR_SUCCESS))
+        else:
+            container.Children.Add(
+                self._build_grid_table([u"動作", u"圖號", u"圖名", u"細節"], changed))
+        self.sync_sv.Content = container
+
+    # ---- 同步分頁：⑤ 套用匯入（會修改 Revit）----
+
+    @staticmethod
+    def _unique_number(num, occupied):
+        """圖號若已被佔用，往後加 -001 -002…（規則 #3）。"""
+        if num not in occupied:
+            return num
+        i = 1
+        while True:
+            cand = u"{}-{:03d}".format(num, i)
+            if cand not in occupied:
+                return cand
+            i += 1
+
+    def _set_param(self, sheet, pname, value):
+        p = sheet.LookupParameter(pname)
+        if p is None or p.IsReadOnly:
+            return
+        try:
+            if p.StorageType == DB.StorageType.String:
+                p.Set(value if value is not None else u"")
+        except Exception:
+            pass
+
+    def _needs_edit(self, s, d):
+        if d["num"] and d["num"] != (s.SheetNumber or u""):
+            return True
+        if d["name"] and d["name"] != (s.Name or u""):
+            return True
+        for label, val in ((u"圖紙類別", d["cat"]), (u"繪圖員", d["drawer"]),
+                           (u"修正備註", d["note"])):
+            cur = self._read_text_param(s, label)
+            cur = cur if cur is not None else u""
+            if val != cur:
+                return True
+        return False
+
+    def _build_plan(self, records):
+        by_uid = {}
+        for s in DB.FilteredElementCollector(doc).OfClass(DB.ViewSheet).ToElements():
+            by_uid[s.UniqueId] = s
+        seen = set()
+        plan = {"new": [], "edit": [], "toReal": [], "toPlace": [],
+                "delete": [], "orphan": 0}
+        for rec in records:
+            uid = unicode(rec.get(u"UID") or u"").strip()
+            d = {
+                "num": unicode(rec.get(u"圖紙號碼") or u""),
+                "name": unicode(rec.get(u"圖紙名稱") or u""),
+                "cat": unicode(rec.get(u"圖紙類別") or u""),
+                "drawer": unicode(rec.get(u"繪圖員") or u""),
+                "note": unicode(rec.get(u"修正備註") or u""),
+                "real": self._truthy(rec.get(u"是否為Revit出圖")),
+            }
+            if not uid:
+                plan["new"].append(d)
+                continue
+            seen.add(uid)
+            s = by_uid.get(uid)
+            if s is None:
+                plan["orphan"] += 1
+                continue
+            d["sheet"] = s
+            if d["real"] and s.IsPlaceholder:
+                plan["toReal"].append(d)
+            elif (not d["real"]) and (not s.IsPlaceholder):
+                plan["toPlace"].append(d)
+            elif self._needs_edit(s, d):
+                plan["edit"].append(d)
+        # Sheet 已把整列(含 id)刪除 → Revit 仍有 → 視為刪除（第3點）
+        for uid, s in by_uid.items():
+            if uid not in seen:
+                plan["delete"].append({"sheet": s})
+        return plan
+
+    def _on_import_apply(self, sender, args):
+        url = (self.gs_url_box.Text or u"").strip()
+        tab = (self.gs_tab_box.Text or u"").strip()
+        if not url or not tab:
+            forms.alert(u"請先填 Web App URL 與目標頁籤名稱。")
+            return
+        result, err = self._post_json(
+            url, {"secret": u"", "tab": tab, "action": "read",
+                  "headerLabels": self.HEADER_LABELS})
+        if err:
+            self._show_sync_msg(u"❌ {}".format(err), self.COLOR_ERROR)
+            return
+        if not (result and result.get("ok")):
+            self._show_sync_msg(
+                u"❌ 讀取失敗：{}".format(result.get("error") if result else u"無回應"),
+                self.COLOR_ERROR)
+            return
+        records = result.get("records") or []
+        if not records:
+            forms.alert(u"Google Sheet 讀不到任何資料列，為避免誤刪已中止。\n"
+                        u"請確認頁籤名稱正確、表格有資料。")
+            return
+        plan = self._build_plan(records)
+        n_new, n_edit = len(plan["new"]), len(plan["edit"])
+        n_real, n_place = len(plan["toReal"]), len(plan["toPlace"])
+        n_del = len(plan["delete"])
+        if not (n_new or n_edit or n_real or n_place or n_del):
+            self._show_sync_msg(u"沒有要套用的變更（Revit 與 Sheet 已一致）。",
+                                self.COLOR_TEXT)
+            return
+
+        del_lines = [u"  {}  {}".format(d["sheet"].SheetNumber, d["sheet"].Name)
+                     for d in plan["toPlace"]]
+        del_lines += [u"  {}  {}".format(d["sheet"].SheetNumber, d["sheet"].Name)
+                      for d in plan["delete"]]
+        msg = (u"即將套用到 Revit：\n"
+               u"🆕 新增 {} 張\n✏️ 修改 {} 張\n⬆️ 轉真實 {} 張\n"
+               u"⚠️ 真實→預留(刪原圖再建預留) {} 張\n"
+               u"🗑️ 刪除(Sheet 已移除) {} 張".format(
+                   n_new, n_edit, n_real, n_place, n_del))
+        if del_lines:
+            msg += u"\n\n【將被刪除的圖紙】\n" + u"\n".join(del_lines[:30])
+            if len(del_lines) > 30:
+                msg += u"\n  …還有 {} 張".format(len(del_lines) - 30)
+        msg += (u"\n\n套用後視窗會自動關閉，並把最新狀態寫回 Google Sheet。\n"
+                u"做完不滿意可按一次 Ctrl+Z 全部復原。\n確定套用嗎？")
+        if not forms.alert(msg, yes=True, no=True):
+            return
+
+        # 重點(第1點)：不在 modal 視窗內改模型(會被還原)。
+        # 收好計畫、關閉視窗，交給 main() 在正確的指令context裡執行交易。
+        plan["tb_id"] = self._get_selected_title_block_id() or DB.ElementId.InvalidElementId
+        plan["url"] = url
+        plan["tab"] = tab
+        self.result = {"mode": "import_apply", "plan": plan}
+        self.confirmed = True
+        self.Close()
+
+    def _apply_plan(self, plan):
+        done = {"new": 0, "edit": 0, "toReal": 0, "toPlace": 0, "delete": 0}
+        fails = []
+        tb_id = plan.get("tb_id") or DB.ElementId.InvalidElementId
+        try:
+            with revit.Transaction("BaF 匯入套用"):
+                targets = []  # (sheet, data) 需要套圖號/圖名/參數
+
+                # 刪除：Sheet 已移除的圖紙（第3點）
+                for d in plan.get("delete", []):
+                    try:
+                        doc.Delete(d["sheet"].Id)
+                        done["delete"] += 1
+                    except Exception as ex:
+                        fails.append((d["sheet"].SheetNumber, u"刪除:" + unicode(ex)))
+
+                for d in plan["toReal"]:
+                    try:
+                        d["sheet"].ConvertToRealSheet(tb_id)
+                        targets.append((d["sheet"], d))
+                        done["toReal"] += 1
+                    except Exception as ex:
+                        fails.append((d.get("num"), u"轉真實:" + unicode(ex)))
+
+                for d in plan["edit"]:
+                    targets.append((d["sheet"], d))
+                    done["edit"] += 1
+
+                for d in plan["new"]:
+                    try:
+                        if d["real"]:
+                            ns = DB.ViewSheet.Create(doc, tb_id)
+                        else:
+                            ns = DB.ViewSheet.CreatePlaceholder(doc)
+                        targets.append((ns, d))
+                        done["new"] += 1
+                    except Exception as ex:
+                        fails.append((d.get("num"), u"新增:" + unicode(ex)))
+
+                for d in plan["toPlace"]:
+                    try:
+                        doc.Delete(d["sheet"].Id)
+                        ns = DB.ViewSheet.CreatePlaceholder(doc)
+                        targets.append((ns, d))
+                        done["toPlace"] += 1
+                    except Exception as ex:
+                        fails.append((d.get("num"), u"降預留:" + unicode(ex)))
+
+                # 兩階段套圖號：先全設暫時號避免互撞
+                tmp_i = 0
+                for sheet, d in targets:
+                    if d["num"]:
+                        try:
+                            sheet.SheetNumber = u"__BAFTMP_{}__".format(tmp_i)
+                            tmp_i += 1
+                        except Exception:
+                            pass
+                occupied = set(
+                    s.SheetNumber for s in
+                    DB.FilteredElementCollector(doc).OfClass(DB.ViewSheet).ToElements()
+                    if not (s.SheetNumber or u"").startswith(u"__BAFTMP_"))
+
+                for sheet, d in targets:
+                    try:
+                        if d["num"]:
+                            uniq = self._unique_number(d["num"], occupied)
+                            sheet.SheetNumber = uniq
+                            occupied.add(uniq)
+                        else:
+                            occupied.add(sheet.SheetNumber)
+                        if d["name"]:
+                            sheet.Name = d["name"]
+                        self._set_param(sheet, u"圖紙類別", d["cat"])
+                        self._set_param(sheet, u"繪圖員", d["drawer"])
+                        self._set_param(sheet, u"修正備註", d["note"])
+                    except Exception as ex:
+                        fails.append((d.get("num"), u"套用欄位:" + unicode(ex)))
+        except Exception as ex:
+            return u"❌ 套用失敗，已自動復原：{}".format(ex), True, done
+
+        report = (u"🆕 新增 {} ／ ✏️ 修改 {} ／ ⬆️ 轉真實 {} ／ "
+                  u"⚠️ 降預留 {} ／ 🗑️ 刪除 {}".format(
+                      done["new"], done["edit"], done["toReal"],
+                      done["toPlace"], done["delete"]))
+        if fails:
+            report += u"\n\n⚠ {} 筆有狀況：\n".format(len(fails)) + u"\n".join(
+                u"{}: {}".format(a, b) for a, b in fails[:15])
+        return report, False, done
 
     # ---- 執行 ----
     
@@ -1692,6 +2105,22 @@ def main():
             output.print_md("\n## 失敗")
             for old_num, reason in failed:
                 output.print_md("- `{}`: {}".format(old_num, reason))
+
+    elif win.result["mode"] == "import_apply":
+        plan = win.result["plan"]
+        # 在 modal 視窗關閉「之後」才改模型，交易才不會被還原（第1點）
+        report, is_err, done = win._apply_plan(plan)
+        output.print_md("# {} 匯入套用".format(u"❌" if is_err else u"✅"))
+        output.print_md(report)
+        # 有新增(Sheet 上沒 id 的列) → 自動把最新狀態含新 UID 回寫 Sheet（第2點）
+        if not is_err and done.get("new", 0) > 0:
+            res, err, n = win._do_export(plan["url"], plan["tab"])
+            if err:
+                output.print_md("\n⚠ 自動回寫 Google Sheet 失敗：{}".format(err))
+            elif res and res.get("ok"):
+                output.print_md("\n🔄 已自動把最新狀態（含新 UID）回寫到 Google Sheet。")
+            else:
+                output.print_md("\n⚠ 自動回寫回應異常：{}".format(res))
 
 
 if __name__ == '__main__':
