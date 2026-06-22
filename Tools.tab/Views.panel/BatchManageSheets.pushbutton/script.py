@@ -157,6 +157,10 @@ class BatchManageSheetsWindow(Window):
 
     # Google Sheet 同步要對照的『自訂文字參數』欄位（圖號/圖名為內建，不放這裡）
     SYNC_TEXT_PARAMS = [u"圖紙類別", u"繪圖員", u"修正備註"]
+
+    # 寫入 Google Sheet 用的表頭名稱（程式會去試算表找同名的欄，可自由調換欄位順序）
+    HEADER_LABELS = [u"UID", u"狀態", u"圖紙類別", u"圖紙號碼",
+                     u"圖紙名稱", u"繪圖員", u"修正備註"]
     
     def __init__(self, title_blocks, existing_sheets):
         self.title_blocks = title_blocks
@@ -1386,6 +1390,22 @@ class BatchManageSheetsWindow(Window):
         container.Children.Add(cell)
         self.sync_sv.Content = container
 
+    def _build_export_records(self):
+        """回傳 (records, 圖紙數)。每筆是 dict，key = 表頭名稱。"""
+        sheets = self._all_sheets_sorted()
+        recs = []
+        for s in sheets:
+            recs.append({
+                u"UID": s.UniqueId,
+                u"狀態": (not s.IsPlaceholder),          # True=真實(打勾), False=預留
+                u"圖紙類別": self._read_text_param(s, u"圖紙類別") or u"",
+                u"圖紙號碼": s.SheetNumber or u"",
+                u"圖紙名稱": s.Name or u"",
+                u"繪圖員": self._read_text_param(s, u"繪圖員") or u"",
+                u"修正備註": self._read_text_param(s, u"修正備註") or u"",
+            })
+        return recs, len(sheets)
+
     def _on_write_gsheet(self, sender, args):
         url = (self.gs_url_box.Text or u"").strip()
         tab = (self.gs_tab_box.Text or u"").strip()
@@ -1396,18 +1416,25 @@ class BatchManageSheetsWindow(Window):
             forms.alert(u"請填寫目標頁籤名稱。")
             return
 
-        rows, n = self._build_export_rows()
+        recs, n = self._build_export_records()
         ok = forms.alert(
             u"即將把 {} 張圖紙寫入 Google Sheet。\n\n"
             u"頁籤：{}\n"
-            u"注意：會覆蓋該頁籤 A~H 欄的現有內容。\n\n要繼續嗎？".format(n, tab),
+            u"程式會依『表頭名稱』找欄位寫入，並鎖定表頭列。\n\n要繼續嗎？".format(n, tab),
             yes=True, no=True)
         if not ok:
             return
 
         save_gsheet_cfg({"url": url, "tab": tab, "secret": u""})
 
-        payload = {"secret": u"", "tab": tab, "rows": rows}
+        payload = {
+            "secret": u"",
+            "tab": tab,
+            "headerLabels": self.HEADER_LABELS,
+            "records": recs,
+            "updateDate": DateTime.Now.ToString("yyyyMMdd"),
+            "lockHeader": True,
+        }
         body = json.dumps(payload)  # ensure_ascii -> 純 ASCII，中文以 \u 編碼
 
         try:
@@ -1431,13 +1458,14 @@ class BatchManageSheetsWindow(Window):
         if result and result.get("ok"):
             note = result.get("note") or u""
             msg = (u"✅ 寫入完成！\n"
-                   u"收到 {} 列、寫入 {} 列到頁籤「{}」。\n"
-                   u"（含更新時間列＋表頭，所以資料張數 = 列數 - 2）\n"
-                   u"回到 Google Sheet 看看 —— 核取方塊、下拉都會自動套好，D 欄紅色三角也會消失。").format(
-                       result.get("received", u"?"), result.get("wrote", u"?"),
-                       result.get("tab", tab))
+                   u"表頭在第 {} 列，寫入 {} 張圖紙到頁籤「{}」。\n"
+                   u"{}\n"
+                   u"回到 Google Sheet 看看 —— 欄位依表頭名稱對位，核取方塊/下拉都自動套好。").format(
+                       result.get("headerRow", u"?"), result.get("wrote", u"?"),
+                       result.get("tab", tab),
+                       u"🔒 表頭已鎖定（只有試算表擁有者能改）。" if result.get("locked") else u"")
             if note:
-                msg += u"\n\n⚠ 部分附加設定有狀況：{}".format(note)
+                msg += u"\n\n⚠ 備註：{}".format(note)
             self._show_sync_msg(msg, self.COLOR_SUCCESS)
         else:
             err = result.get("error") if result else resp
