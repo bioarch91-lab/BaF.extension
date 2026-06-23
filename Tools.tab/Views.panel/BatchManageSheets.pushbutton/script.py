@@ -161,8 +161,8 @@ class BatchManageSheetsWindow(Window):
     # 寫入 Google Sheet 用的表頭名稱（程式會去試算表找同名的欄，可自由調換欄位順序）
     HEADER_LABELS = [u"UID", u"是否為Revit出圖", u"圖紙類別", u"圖紙號碼",
                      u"圖紙名稱", u"繪圖員", u"修正備註"]
-    CHECKBOX_LABEL = u"是否為Revit出圖"          # 這欄在 Google Sheet 套核取方塊
-    DROPDOWN_LABELS = [u"圖紙類別", u"繪圖員"]    # 這些欄套下拉選單
+    CHECKBOX_LABEL = u"是否為Revit出圖"   # 這欄在 Google Sheet 套核取方塊
+    DROPDOWN_LABELS = [u"繪圖員"]          # 這些欄套下拉選單（圖紙類別改為一般文字）
     
     def __init__(self, title_blocks, existing_sheets):
         self.title_blocks = title_blocks
@@ -171,7 +171,8 @@ class BatchManageSheetsWindow(Window):
         
         self.result = None
         self.confirmed = False
-        
+        self._pending_plan = None  # 匯入預覽後暫存的套用計畫
+
         # 表格輸入模式的列容器
         self.table_rows = []
         
@@ -1110,10 +1111,12 @@ class BatchManageSheetsWindow(Window):
         hint.Padding = Thickness(12, 8, 12, 8)
         hint.Margin = Thickness(0, 0, 0, 12)
         hint_text = TextBlock()
-        hint_text.Text = (u"① 讀取：把目前模型的圖紙索引列出來（唯讀）。\n"
-                          u"② 複製到剪貼簿：照排版複製，可手動貼到試算表（備用）。\n"
-                          u"③ 匯出：一鍵把 Revit 圖紙索引寫入 Google Sheet。\n"
-                          u"（匯入：從 Google Sheet 讀回 Revit —— 開發中）")
+        hint_text.Text = (u"1、第一次使用請先讀「操作說明」，並在 Google Sheet 載入「最新腳本」。\n"
+                          u"2、功能介紹：\n"
+                          u"    匯出：把 Revit 圖紙索引寫進 Google Sheet。\n"
+                          u"    匯入：從 Google Sheet 讀回 → 先預覽差異 → 按「確認執行」才套用；"
+                          u"完成後自動回寫新 UID 並關閉視窗，異常會跳警示。\n"
+                          u"    派工系統：藉由派工系統產出協作設計師工作清單。")
         hint_text.FontSize = 11
         hint_text.TextWrapping = TextWrapping.Wrap
         hint_text.Foreground = self._brush((40, 50, 80))
@@ -1121,34 +1124,28 @@ class BatchManageSheetsWindow(Window):
         Grid.SetRow(hint, 0)
         outer.Children.Add(hint)
 
-        btn_row = StackPanel()
-        btn_row.Orientation = Orientation.Horizontal
-        btn_row.Margin = Thickness(0, 0, 0, 10)
+        # 文件按鈕列：操作說明 / 最新腳本
+        doc_row = StackPanel()
+        doc_row.Orientation = Orientation.Horizontal
+        doc_row.Margin = Thickness(0, 0, 0, 10)
 
-        read_btn = Button()
-        read_btn.Content = u"① 讀取目前圖紙索引"
-        read_btn.Padding = Thickness(10, 5, 10, 5)
-        read_btn.Margin = Thickness(0, 0, 8, 0)
-        read_btn.Click += self._on_read_index
-        btn_row.Children.Add(read_btn)
+        manual_btn = Button()
+        manual_btn.Content = u"📖 操作說明"
+        manual_btn.Padding = Thickness(10, 5, 10, 5)
+        manual_btn.Margin = Thickness(0, 0, 8, 0)
+        manual_btn.Click += self._on_open_manual
+        doc_row.Children.Add(manual_btn)
 
-        export_btn = Button()
-        export_btn.Content = u"② 複製到剪貼簿（備用）"
-        export_btn.Padding = Thickness(10, 5, 10, 5)
-        export_btn.Margin = Thickness(0, 0, 8, 0)
-        export_btn.Click += self._on_export_clipboard
-        btn_row.Children.Add(export_btn)
+        script_btn = Button()
+        script_btn.Content = u"📄 最新腳本"
+        script_btn.Padding = Thickness(10, 5, 10, 5)
+        script_btn.Click += self._on_open_script
+        doc_row.Children.Add(script_btn)
 
-        param_btn = Button()
-        param_btn.Content = u"列出第一張圖紙所有參數名稱"
-        param_btn.Padding = Thickness(10, 5, 10, 5)
-        param_btn.Click += self._on_list_params
-        btn_row.Children.Add(param_btn)
+        Grid.SetRow(doc_row, 1)
+        outer.Children.Add(doc_row)
 
-        Grid.SetRow(btn_row, 1)
-        outer.Children.Add(btn_row)
-
-        # ③ 寫入 Google Sheet 設定區
+        # 設定區 + 匯出/匯入/指派
         cfg = load_gsheet_cfg()
         cfg_box = Border()
         cfg_box.Background = self._brush((245, 247, 250))
@@ -1178,7 +1175,7 @@ class BatchManageSheetsWindow(Window):
         wbtn_row.Orientation = Orientation.Horizontal
 
         write_btn = Button()
-        write_btn.Content = u"③ 匯出（寫入 Google Sheet）"
+        write_btn.Content = u"匯出（寫入 Google Sheet）"
         write_btn.Padding = Thickness(12, 6, 12, 6)
         write_btn.Margin = Thickness(0, 0, 8, 0)
         write_btn.Background = self._brush(self.COLOR_PRIMARY)
@@ -1188,21 +1185,21 @@ class BatchManageSheetsWindow(Window):
         wbtn_row.Children.Add(write_btn)
 
         import_btn = Button()
-        import_btn.Content = u"④ 匯入（預覽差異）"
+        import_btn.Content = u"匯入（預覽差異）"
         import_btn.Padding = Thickness(12, 6, 12, 6)
         import_btn.Margin = Thickness(0, 0, 8, 0)
+        import_btn.Background = self._brush((217, 119, 6))
+        import_btn.Foreground = self._brush(self.COLOR_TEXT_LIGHT)
         import_btn.FontWeight = FontWeights.Bold
         import_btn.Click += self._on_import_preview
         wbtn_row.Children.Add(import_btn)
 
-        apply_btn = Button()
-        apply_btn.Content = u"⑤ 套用匯入（改 Revit）"
-        apply_btn.Padding = Thickness(12, 6, 12, 6)
-        apply_btn.FontWeight = FontWeights.Bold
-        apply_btn.Background = self._brush((217, 119, 6))
-        apply_btn.Foreground = self._brush(self.COLOR_TEXT_LIGHT)
-        apply_btn.Click += self._on_import_apply
-        wbtn_row.Children.Add(apply_btn)
+        assign_btn = Button()
+        assign_btn.Content = u"指派工作任務"
+        assign_btn.Padding = Thickness(12, 6, 12, 6)
+        assign_btn.FontWeight = FontWeights.Bold
+        assign_btn.Click += self._on_assign_tasks
+        wbtn_row.Children.Add(assign_btn)
 
         cfg_panel.Children.Add(wbtn_row)
 
@@ -1220,7 +1217,7 @@ class BatchManageSheetsWindow(Window):
         placeholder = TextBlock()
         placeholder.Margin = Thickness(12, 12, 12, 12)
         placeholder.Foreground = self._brush((110, 115, 130))
-        placeholder.Text = u"（按上方「① 讀取目前圖紙索引」開始）"
+        placeholder.Text = u"（按「匯入（預覽差異）」開始）"
         sv.Content = placeholder
         Grid.SetRow(sv, 3)
         outer.Children.Add(sv)
@@ -1458,6 +1455,23 @@ class BatchManageSheetsWindow(Window):
         result, err = self._post_json(url, payload)
         return result, err, n
 
+    def _do_split(self, url, tab):
+        """依圖紙類別拆成多個工作表。回傳 (result, err, 張數)。"""
+        recs, n = self._build_export_records()
+        payload = {
+            "secret": u"",
+            "tab": tab,
+            "action": "split",
+            "headerLabels": self.HEADER_LABELS,
+            "checkboxLabel": self.CHECKBOX_LABEL,
+            "dropdownLabels": self.DROPDOWN_LABELS,
+            "records": recs,
+            "updateDate": DateTime.Now.ToString("yyyyMMdd"),
+            "lockHeader": True,
+        }
+        result, err = self._post_json(url, payload)
+        return result, err, n
+
     def _on_write_gsheet(self, sender, args):
         url = (self.gs_url_box.Text or u"").strip()
         tab = (self.gs_tab_box.Text or u"").strip()
@@ -1525,6 +1539,22 @@ class BatchManageSheetsWindow(Window):
                        u"🔒 表頭已鎖定（只有擁有者能改）。" if result.get("locked") else u"")
             if note:
                 msg += u"\n\n⚠ 備註：{}".format(note)
+            # 第二步：選擇是否依「圖紙類別」拆成多個工作表
+            if forms.alert(u"匯出完成。\n\n要再依『圖紙類別』拆成多個工作表嗎？\n"
+                           u"（每個類別一個分頁、以類別命名）",
+                           yes=True, no=True):
+                sres, serr, _ = self._do_split(url, tab)
+                if serr:
+                    msg += u"\n\n⚠ 拆分失敗：{}".format(serr)
+                elif sres and sres.get("ok"):
+                    made = sres.get("splitTabs") or []
+                    if made:
+                        msg += u"\n\n🗂️ 已依圖紙類別拆出 {} 個工作表：\n{}".format(
+                            len(made), u"、".join(made))
+                    else:
+                        msg += u"\n\n（沒有可拆分的圖紙類別）"
+                else:
+                    msg += u"\n\n⚠ 拆分回應異常：{}".format(sres)
             self._show_sync_msg(msg, self.COLOR_SUCCESS)
         else:
             err = result.get("error") if result else resp
@@ -1560,15 +1590,16 @@ class BatchManageSheetsWindow(Window):
         return unicode(v).strip().upper() in (u"TRUE", u"1", u"V", u"X", u"是", u"YES")
 
     def _on_import_preview(self, sender, args):
+        self._pending_plan = None
         url = (self.gs_url_box.Text or u"").strip()
         tab = (self.gs_tab_box.Text or u"").strip()
         if not url or not tab:
             forms.alert(u"請先填 Web App URL 與目標頁籤名稱。")
             return
         save_gsheet_cfg({"url": url, "tab": tab, "secret": u""})
-        payload = {"secret": u"", "tab": tab, "action": "read",
-                   "headerLabels": self.HEADER_LABELS}
-        result, err = self._post_json(url, payload)
+        result, err = self._post_json(
+            url, {"secret": u"", "tab": tab, "action": "read",
+                  "headerLabels": self.HEADER_LABELS})
         if err:
             self._show_sync_msg(u"❌ {}".format(err), self.COLOR_ERROR)
             return
@@ -1578,7 +1609,22 @@ class BatchManageSheetsWindow(Window):
                 self.COLOR_ERROR)
             return
         records = result.get("records") or []
-        self._show_diff(records, self._compute_diff(records))
+        if not records:
+            forms.alert(u"Google Sheet 讀不到任何資料列，為避免誤刪已中止。\n"
+                        u"請確認頁籤名稱正確、表格有資料。")
+            return
+        dup_msg = self._check_dup_numbers(records)
+        if dup_msg:
+            forms.alert(dup_msg)
+            return
+        plan = self._build_plan(records)
+        plan["tb_id"] = self._get_selected_title_block_id() or DB.ElementId.InvalidElementId
+        plan["url"] = url
+        plan["tab"] = tab
+        n_changes = (len(plan["new"]) + len(plan["edit"]) + len(plan["toReal"])
+                     + len(plan["toPlace"]) + len(plan["delete"]))
+        self._pending_plan = plan if n_changes else None
+        self._show_diff(records, self._compute_diff(records), n_changes)
 
     def _compute_diff(self, records):
         by_uid = {}
@@ -1602,7 +1648,8 @@ class BatchManageSheetsWindow(Window):
             s = by_uid.get(uid)
             if s is None:
                 counts["orphan"] += 1
-                rows.append((u"⛔ 找不到對應", num, nm, u"此 UID 在 Revit 不存在"))
+                rows.append((u"🆕 新增(原 id 已失效)", num, nm,
+                             u"將新建圖紙並回寫新 UID"))
                 continue
             detail = []
             cur_num = s.SheetNumber or u""
@@ -1613,6 +1660,8 @@ class BatchManageSheetsWindow(Window):
                 detail.append(u"圖名 {}→{}".format(cur_nm, nm))
             for label in (u"圖紙類別", u"繪圖員", u"修正備註"):
                 newv = unicode(rec.get(label) or u"")
+                if not newv:
+                    continue  # 空白=不變更
                 curv = self._read_text_param(s, label)
                 curv = curv if curv is not None else u""
                 if newv != curv:
@@ -1633,14 +1682,15 @@ class BatchManageSheetsWindow(Window):
         revit_only = [s for uid, s in by_uid.items() if uid not in seen]
         return rows, counts, revit_only
 
-    def _show_diff(self, records, diff):
+    def _show_diff(self, records, diff, has_changes=False):
         rows, counts, revit_only = diff
         container = StackPanel()
         container.Margin = Thickness(10, 10, 10, 10)
+
         summary = self._make_cell(
             u"差異預覽（唯讀，尚未套用任何變更）\n"
             u"Google Sheet 共 {} 筆　→　新增 {}／修改 {}／轉真實 {}／降預留刪除 {}／"
-            u"找不到對應 {}／無變更 {}\n"
+            u"原id失效→新建 {}／無變更 {}\n"
             u"刪除(Sheet 已移除)：{} 張（按⑤套用時會列清單再確認）".format(
                 len(records), counts["new"], counts["edit"], counts["toReal"],
                 counts["toPlace"], counts["orphan"], counts["same"], len(revit_only)),
@@ -1661,21 +1711,23 @@ class BatchManageSheetsWindow(Window):
         else:
             container.Children.Add(
                 self._build_grid_table([u"動作", u"圖號", u"圖名", u"細節"], changed))
+
+        # 確認執行鍵放在差異清單「下面」
+        if has_changes:
+            exec_btn = Button()
+            exec_btn.Content = u"✅ 確認執行（套用到 Revit）"
+            exec_btn.Padding = Thickness(14, 8, 14, 8)
+            exec_btn.Margin = Thickness(0, 14, 0, 0)
+            exec_btn.HorizontalAlignment = HorizontalAlignment.Left
+            exec_btn.Background = self._brush(self.COLOR_SUCCESS)
+            exec_btn.Foreground = self._brush(self.COLOR_TEXT_LIGHT)
+            exec_btn.FontWeight = FontWeights.Bold
+            exec_btn.Click += self._on_import_execute
+            container.Children.Add(exec_btn)
+
         self.sync_sv.Content = container
 
     # ---- 同步分頁：⑤ 套用匯入（會修改 Revit）----
-
-    @staticmethod
-    def _unique_number(num, occupied):
-        """圖號若已被佔用，往後加 -001 -002…（規則 #3）。"""
-        if num not in occupied:
-            return num
-        i = 1
-        while True:
-            cand = u"{}-{:03d}".format(num, i)
-            if cand not in occupied:
-                return cand
-            i += 1
 
     def _set_param(self, sheet, pname, value):
         p = sheet.LookupParameter(pname)
@@ -1688,12 +1740,15 @@ class BatchManageSheetsWindow(Window):
             pass
 
     def _needs_edit(self, s, d):
+        # 空白 = 不變更（與「編輯既有」一致，不會清掉既有資料）
         if d["num"] and d["num"] != (s.SheetNumber or u""):
             return True
         if d["name"] and d["name"] != (s.Name or u""):
             return True
         for label, val in ((u"圖紙類別", d["cat"]), (u"繪圖員", d["drawer"]),
                            (u"修正備註", d["note"])):
+            if not val:
+                continue
             cur = self._read_text_param(s, label)
             cur = cur if cur is not None else u""
             if val != cur:
@@ -1723,6 +1778,8 @@ class BatchManageSheetsWindow(Window):
             seen.add(uid)
             s = by_uid.get(uid)
             if s is None:
+                # 沒有相對應的 id → 當新圖紙建立（套用後回寫正確的新 UID）
+                plan["new"].append(d)
                 plan["orphan"] += 1
                 continue
             d["sheet"] = s
@@ -1738,63 +1795,69 @@ class BatchManageSheetsWindow(Window):
                 plan["delete"].append({"sheet": s})
         return plan
 
-    def _on_import_apply(self, sender, args):
-        url = (self.gs_url_box.Text or u"").strip()
-        tab = (self.gs_tab_box.Text or u"").strip()
-        if not url or not tab:
-            forms.alert(u"請先填 Web App URL 與目標頁籤名稱。")
-            return
-        result, err = self._post_json(
-            url, {"secret": u"", "tab": tab, "action": "read",
-                  "headerLabels": self.HEADER_LABELS})
-        if err:
-            self._show_sync_msg(u"❌ {}".format(err), self.COLOR_ERROR)
-            return
-        if not (result and result.get("ok")):
-            self._show_sync_msg(
-                u"❌ 讀取失敗：{}".format(result.get("error") if result else u"無回應"),
-                self.COLOR_ERROR)
-            return
-        records = result.get("records") or []
-        if not records:
-            forms.alert(u"Google Sheet 讀不到任何資料列，為避免誤刪已中止。\n"
-                        u"請確認頁籤名稱正確、表格有資料。")
-            return
-        plan = self._build_plan(records)
-        n_new, n_edit = len(plan["new"]), len(plan["edit"])
-        n_real, n_place = len(plan["toReal"]), len(plan["toPlace"])
-        n_del = len(plan["delete"])
-        if not (n_new or n_edit or n_real or n_place or n_del):
-            self._show_sync_msg(u"沒有要套用的變更（Revit 與 Sheet 已一致）。",
-                                self.COLOR_TEXT)
-            return
+    def _check_dup_numbers(self, records):
+        """檢查圖號是否重複；有重複回傳警示文字，否則 None。"""
+        num_count = {}
+        for rec in records:
+            rnum = unicode(rec.get(u"圖紙號碼") or u"").strip()
+            if not rnum:
+                continue  # 空白圖號保留 Revit 預設，不列入重複檢查
+            num_count[rnum] = num_count.get(rnum, 0) + 1
+        dups = sorted([n for n, c in num_count.items() if c > 1])
+        if dups:
+            return (u"發現重複圖號，無法執行匯入。\n"
+                    u"請先到 Google Sheet 把下列圖號改成唯一，再按一次「匯入」：\n\n"
+                    + u"\n".join(u"  • {} （重複 {} 次）".format(n, num_count[n])
+                                 for n in dups))
+        return None
 
+    def _on_import_execute(self, sender, args):
+        plan = getattr(self, "_pending_plan", None)
+        if not plan:
+            forms.alert(u"請先按「匯入（預覽差異）」載入要套用的內容。")
+            return
+        # 刪除前清單確認（你的要求）
         del_lines = [u"  {}  {}".format(d["sheet"].SheetNumber, d["sheet"].Name)
                      for d in plan["toPlace"]]
         del_lines += [u"  {}  {}".format(d["sheet"].SheetNumber, d["sheet"].Name)
                       for d in plan["delete"]]
-        msg = (u"即將套用到 Revit：\n"
-               u"🆕 新增 {} 張\n✏️ 修改 {} 張\n⬆️ 轉真實 {} 張\n"
-               u"⚠️ 真實→預留(刪原圖再建預留) {} 張\n"
-               u"🗑️ 刪除(Sheet 已移除) {} 張".format(
-                   n_new, n_edit, n_real, n_place, n_del))
         if del_lines:
-            msg += u"\n\n【將被刪除的圖紙】\n" + u"\n".join(del_lines[:30])
+            msg = u"以下圖紙將被刪除，確定執行嗎？\n\n" + u"\n".join(del_lines[:30])
             if len(del_lines) > 30:
                 msg += u"\n  …還有 {} 張".format(len(del_lines) - 30)
-        msg += (u"\n\n套用後視窗會自動關閉，並把最新狀態寫回 Google Sheet。\n"
-                u"做完不滿意可按一次 Ctrl+Z 全部復原。\n確定套用嗎？")
-        if not forms.alert(msg, yes=True, no=True):
-            return
-
-        # 重點(第1點)：不在 modal 視窗內改模型(會被還原)。
-        # 收好計畫、關閉視窗，交給 main() 在正確的指令context裡執行交易。
-        plan["tb_id"] = self._get_selected_title_block_id() or DB.ElementId.InvalidElementId
-        plan["url"] = url
-        plan["tab"] = tab
+            if not forms.alert(msg, yes=True, no=True):
+                return
+        # 不在 modal 視窗內改模型(會被還原)；關窗後由 main() 執行交易
         self.result = {"mode": "import_apply", "plan": plan}
         self.confirmed = True
         self.Close()
+
+    def _on_assign_tasks(self, sender, args):
+        forms.alert(u"「指派工作任務」功能開發中。\n\n"
+                    u"未來按下後，會把『修正備註』欄裡的工作，\n"
+                    u"分配給對應的『繪圖員』同事。\n（分配方式待討論）")
+
+    def _docs_path(self, filename):
+        """回傳擴充功能 docs 資料夾下的檔案完整路徑。"""
+        here = os.path.dirname(__file__)
+        return os.path.normpath(
+            os.path.join(here, u"..", u"..", u"..", u"docs", filename))
+
+    def _open_doc(self, filename, what):
+        p = self._docs_path(filename)
+        if not os.path.exists(p):
+            forms.alert(u"找不到{}：\n{}".format(what, p))
+            return
+        try:
+            os.startfile(p)
+        except Exception as ex:
+            forms.alert(u"開啟{}失敗：{}\n\n你可以手動到這個位置打開：\n{}".format(what, ex, p))
+
+    def _on_open_manual(self, sender, args):
+        self._open_doc(u"使用說明_從零設定.txt", u"操作說明")
+
+    def _on_open_script(self, sender, args):
+        self._open_doc(u"gsheet_sync_appscript.gs", u"最新腳本")
 
     def _apply_plan(self, plan):
         done = {"new": 0, "edit": 0, "toReal": 0, "toPlace": 0, "delete": 0}
@@ -1802,9 +1865,9 @@ class BatchManageSheetsWindow(Window):
         tb_id = plan.get("tb_id") or DB.ElementId.InvalidElementId
         try:
             with revit.Transaction("BaF 匯入套用"):
-                targets = []  # (sheet, data) 需要套圖號/圖名/參數
+                targets = []  # (sheet, data, is_new)
 
-                # 刪除：Sheet 已移除的圖紙（第3點）
+                # 刪除：Sheet 整列(含 id)被移除的圖紙
                 for d in plan.get("delete", []):
                     try:
                         doc.Delete(d["sheet"].Id)
@@ -1815,13 +1878,13 @@ class BatchManageSheetsWindow(Window):
                 for d in plan["toReal"]:
                     try:
                         d["sheet"].ConvertToRealSheet(tb_id)
-                        targets.append((d["sheet"], d))
+                        targets.append((d["sheet"], d, False))
                         done["toReal"] += 1
                     except Exception as ex:
                         fails.append((d.get("num"), u"轉真實:" + unicode(ex)))
 
                 for d in plan["edit"]:
-                    targets.append((d["sheet"], d))
+                    targets.append((d["sheet"], d, False))
                     done["edit"] += 1
 
                 for d in plan["new"]:
@@ -1830,7 +1893,7 @@ class BatchManageSheetsWindow(Window):
                             ns = DB.ViewSheet.Create(doc, tb_id)
                         else:
                             ns = DB.ViewSheet.CreatePlaceholder(doc)
-                        targets.append((ns, d))
+                        targets.append((ns, d, True))
                         done["new"] += 1
                     except Exception as ex:
                         fails.append((d.get("num"), u"新增:" + unicode(ex)))
@@ -1839,38 +1902,46 @@ class BatchManageSheetsWindow(Window):
                     try:
                         doc.Delete(d["sheet"].Id)
                         ns = DB.ViewSheet.CreatePlaceholder(doc)
-                        targets.append((ns, d))
+                        targets.append((ns, d, True))
                         done["toPlace"] += 1
                     except Exception as ex:
                         fails.append((d.get("num"), u"降預留:" + unicode(ex)))
 
-                # 兩階段套圖號：先全設暫時號避免互撞
+                # 只處理「有指定圖號」的；沒給圖號就保留 Revit 預設(不再指派未命名)
+                renum = [t for t in targets if t[1]["num"]]
+
+                # 兩階段：先全設暫時號避免互撞
                 tmp_i = 0
-                for sheet, d in targets:
-                    if d["num"]:
-                        try:
-                            sheet.SheetNumber = u"__BAFTMP_{}__".format(tmp_i)
-                            tmp_i += 1
-                        except Exception:
-                            pass
+                for sheet, d, isnew in renum:
+                    try:
+                        sheet.SheetNumber = u"__BAFTMP_{}__".format(tmp_i)
+                        tmp_i += 1
+                    except Exception:
+                        pass
                 occupied = set(
                     s.SheetNumber for s in
                     DB.FilteredElementCollector(doc).OfClass(DB.ViewSheet).ToElements()
                     if not (s.SheetNumber or u"").startswith(u"__BAFTMP_"))
 
-                for sheet, d in targets:
+                # 設最終圖號（重複已在套用前擋掉，不自動加尾碼）
+                for sheet, d, isnew in renum:
                     try:
-                        if d["num"]:
-                            uniq = self._unique_number(d["num"], occupied)
-                            sheet.SheetNumber = uniq
-                            occupied.add(uniq)
-                        else:
-                            occupied.add(sheet.SheetNumber)
+                        sheet.SheetNumber = d["num"]
+                        occupied.add(d["num"])
+                    except Exception as ex:
+                        fails.append((d.get("num"), u"設定圖號:" + unicode(ex)))
+
+                # 設圖名與參數（空白=不覆蓋，不再自動命名）
+                for sheet, d, isnew in targets:
+                    try:
                         if d["name"]:
                             sheet.Name = d["name"]
-                        self._set_param(sheet, u"圖紙類別", d["cat"])
-                        self._set_param(sheet, u"繪圖員", d["drawer"])
-                        self._set_param(sheet, u"修正備註", d["note"])
+                        if d["cat"]:
+                            self._set_param(sheet, u"圖紙類別", d["cat"])
+                        if d["drawer"]:
+                            self._set_param(sheet, u"繪圖員", d["drawer"])
+                        if d["note"]:
+                            self._set_param(sheet, u"修正備註", d["note"])
                     except Exception as ex:
                         fails.append((d.get("num"), u"套用欄位:" + unicode(ex)))
         except Exception as ex:
@@ -2069,12 +2140,27 @@ def edit_sheets(result, document):
 # ---------------------------------------------------------------------------
 
 def main():
+    # 開新視窗前，先關掉上一個還開著的（用 AppDomain 跨次記住）
+    from System import AppDomain
+    _WKEY = "BAF_SheetMgr_Window"
+    prev = AppDomain.CurrentDomain.GetData(_WKEY)
+    if prev is not None:
+        try:
+            prev.Close()
+        except Exception:
+            pass
+        AppDomain.CurrentDomain.SetData(_WKEY, None)
+
     title_blocks = get_title_block_types(doc)
     existing_sheets = get_existing_sheets(doc)
-    
+
     win = BatchManageSheetsWindow(title_blocks, existing_sheets)
+    AppDomain.CurrentDomain.SetData(_WKEY, win)
     win.ShowDialog()
-    
+    # 只有當記錄的還是自己時才清掉（避免清掉後開的新視窗）
+    if AppDomain.CurrentDomain.GetData(_WKEY) is win:
+        AppDomain.CurrentDomain.SetData(_WKEY, None)
+
     if not win.confirmed:
         script.exit()
     
@@ -2113,12 +2199,15 @@ def main():
         output.print_md("# {} 匯入套用".format(u"❌" if is_err else u"✅"))
         output.print_md(report)
         # 有新增(Sheet 上沒 id 的列) → 自動把最新狀態含新 UID 回寫 Sheet（第2點）
-        if not is_err and done.get("new", 0) > 0:
+        # 有新增/原id失效→新建/刪除重建 → UID 會變動，套用後自動回寫 Google Sheet
+        need_wb = not is_err and (done.get("new", 0) > 0
+                                  or done.get("toPlace", 0) > 0)
+        if need_wb:
             res, err, n = win._do_export(plan["url"], plan["tab"])
             if err:
                 output.print_md("\n⚠ 自動回寫 Google Sheet 失敗：{}".format(err))
             elif res and res.get("ok"):
-                output.print_md("\n🔄 已自動把最新狀態（含新 UID）回寫到 Google Sheet。")
+                output.print_md("\n🔄 已自動回寫 Google Sheet（更新變動/新建的 UID）。")
             else:
                 output.print_md("\n⚠ 自動回寫回應異常：{}".format(res))
 
