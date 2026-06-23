@@ -163,6 +163,8 @@ class BatchManageSheetsWindow(Window):
                      u"圖紙名稱", u"繪圖員", u"修正備註"]
     CHECKBOX_LABEL = u"是否為Revit出圖"   # 這欄在 Google Sheet 套核取方塊
     DROPDOWN_LABELS = [u"繪圖員"]          # 這些欄套下拉選單（圖紙類別改為一般文字）
+    # 分表標頭的「整批共用」參數：同一圖紙類別批次出圖時一致的資訊
+    BATCH_PARAMS = [u"審圖員", u"設計者", u"批准者", u"圖紙發布日期", u"校核2"]
     
     def __init__(self, title_blocks, existing_sheets):
         self.title_blocks = title_blocks
@@ -1359,7 +1361,7 @@ class BatchManageSheetsWindow(Window):
     def _build_export_rows(self):
         """回傳 (二維字串陣列, 圖紙數)。欄位順序: A空 B:UID C:狀態 D:類別 E:圖號 F:圖名 G:繪圖員 H:備註"""
         sheets = self._all_sheets_sorted()
-        date_str = DateTime.Now.ToString("yyyyMMdd")
+        date_str = DateTime.Now.ToString("yyyyMMdd，HH:mm")
 
         rows = []
         # 第1列：更新時間（日期放 E 欄）
@@ -1424,11 +1426,11 @@ class BatchManageSheetsWindow(Window):
         self.sync_sv.Content = container
 
     def _build_export_records(self):
-        """回傳 (records, 圖紙數)。每筆是 dict，key = 表頭名稱。"""
+        """回傳 (records, 圖紙數)。每筆是 dict，key = 表頭名稱（含批次參數，供拆分填標頭）。"""
         sheets = self._all_sheets_sorted()
         recs = []
         for s in sheets:
-            recs.append({
+            rec = {
                 u"UID": s.UniqueId,
                 u"是否為Revit出圖": (not s.IsPlaceholder),   # True=Revit出圖(真實), False=CAD(預留)
                 u"圖紙類別": self._read_text_param(s, u"圖紙類別") or u"",
@@ -1436,7 +1438,10 @@ class BatchManageSheetsWindow(Window):
                 u"圖紙名稱": s.Name or u"",
                 u"繪圖員": self._read_text_param(s, u"繪圖員") or u"",
                 u"修正備註": self._read_text_param(s, u"修正備註") or u"",
-            })
+            }
+            for k in self.BATCH_PARAMS:
+                rec[k] = self._read_text_param(s, k) or u""
+            recs.append(rec)
         return recs, len(sheets)
 
     def _do_export(self, url, tab):
@@ -1449,7 +1454,7 @@ class BatchManageSheetsWindow(Window):
             "checkboxLabel": self.CHECKBOX_LABEL,
             "dropdownLabels": self.DROPDOWN_LABELS,
             "records": recs,
-            "updateDate": DateTime.Now.ToString("yyyyMMdd"),
+            "updateDate": DateTime.Now.ToString("yyyyMMdd，HH:mm"),
             "lockHeader": True,
         }
         result, err = self._post_json(url, payload)
@@ -1466,7 +1471,7 @@ class BatchManageSheetsWindow(Window):
             "checkboxLabel": self.CHECKBOX_LABEL,
             "dropdownLabels": self.DROPDOWN_LABELS,
             "records": recs,
-            "updateDate": DateTime.Now.ToString("yyyyMMdd"),
+            "updateDate": DateTime.Now.ToString("yyyyMMdd，HH:mm"),
             "lockHeader": True,
         }
         result, err = self._post_json(url, payload)
@@ -1500,7 +1505,7 @@ class BatchManageSheetsWindow(Window):
             "checkboxLabel": self.CHECKBOX_LABEL,
             "dropdownLabels": self.DROPDOWN_LABELS,
             "records": recs,
-            "updateDate": DateTime.Now.ToString("yyyyMMdd"),
+            "updateDate": DateTime.Now.ToString("yyyyMMdd，HH:mm"),
             "lockHeader": True,
         }
         body = json.dumps(payload)  # ensure_ascii -> 純 ASCII，中文以 \u 編碼
@@ -1617,103 +1622,101 @@ class BatchManageSheetsWindow(Window):
         if dup_msg:
             forms.alert(dup_msg)
             return
-        plan = self._build_plan(records)
+        role = result.get("role") or u"main"
+        category = result.get("category") or u""
+        batch = result.get("batchParams") or {}
+        main_tab = result.get("mainTab") or tab
+
+        if role == u"sub" and category:
+            plan = self._build_plan(records, scope_category=category, batch=batch)
+            scope_note = u"【分表匯入】只影響圖紙類別＝「{}」的圖紙。".format(category)
+        else:
+            plan = self._build_plan(records)
+            scope_note = u"【總表匯入】影響全部圖紙。"
+
         plan["tb_id"] = self._get_selected_title_block_id() or DB.ElementId.InvalidElementId
         plan["url"] = url
         plan["tab"] = tab
+        plan["role"] = role
+        plan["mainTab"] = main_tab
+
         n_changes = (len(plan["new"]) + len(plan["edit"]) + len(plan["toReal"])
                      + len(plan["toPlace"]) + len(plan["delete"]))
         self._pending_plan = plan if n_changes else None
-        self._show_diff(records, self._compute_diff(records), n_changes)
+        self._show_diff(plan, scope_note)
 
-    def _compute_diff(self, records):
-        by_uid = {}
-        for s in DB.FilteredElementCollector(doc).OfClass(DB.ViewSheet).ToElements():
-            by_uid[s.UniqueId] = s
-        seen = set()
+    def _edit_detail(self, d):
+        """產生『修改了哪些欄位』的說明文字（給預覽用）。"""
+        s = d.get("sheet")
+        if not s:
+            return u""
+        out = []
+        if d["num"] and d["num"] != (s.SheetNumber or u""):
+            out.append(u"圖號→{}".format(d["num"]))
+        if d["name"] and d["name"] != (s.Name or u""):
+            out.append(u"圖名→{}".format(d["name"]))
+        for label, val in ((u"圖紙類別", d["cat"]), (u"繪圖員", d["drawer"]),
+                           (u"修正備註", d["note"])):
+            if not val:
+                continue
+            cur = self._read_text_param(s, label) or u""
+            if val != cur:
+                out.append(u"{}→{}".format(label, val))
+        for k, v in d.get("extra", {}).items():
+            if not v:
+                continue
+            cur = self._read_text_param(s, k) or u""
+            if v != cur:
+                out.append(u"{}→{}".format(k, v))
+        return u"; ".join(out)
+
+    def _plan_to_rows(self, plan):
+        """把套用計畫轉成預覽表格列（與實際套用同一份計畫，不會有落差）。"""
         rows = []
-        counts = {"new": 0, "edit": 0, "toReal": 0, "toPlace": 0,
-                  "orphan": 0, "same": 0}
-        for rec in records:
-            uid = unicode(rec.get(u"UID") or u"").strip()
-            num = unicode(rec.get(u"圖紙號碼") or u"")
-            nm = unicode(rec.get(u"圖紙名稱") or u"")
-            want_real = self._truthy(rec.get(u"是否為Revit出圖"))
-            if not uid:
-                counts["new"] += 1
-                rows.append((u"🆕 新增" + (u"(真實)" if want_real else u"(預留)"),
-                             num, nm, u""))
-                continue
-            seen.add(uid)
-            s = by_uid.get(uid)
-            if s is None:
-                counts["orphan"] += 1
-                rows.append((u"🆕 新增(原 id 已失效)", num, nm,
-                             u"將新建圖紙並回寫新 UID"))
-                continue
-            detail = []
-            cur_num = s.SheetNumber or u""
-            cur_nm = s.Name or u""
-            if num and num != cur_num:
-                detail.append(u"圖號 {}→{}".format(cur_num, num))
-            if nm and nm != cur_nm:
-                detail.append(u"圖名 {}→{}".format(cur_nm, nm))
-            for label in (u"圖紙類別", u"繪圖員", u"修正備註"):
-                newv = unicode(rec.get(label) or u"")
-                if not newv:
-                    continue  # 空白=不變更
-                curv = self._read_text_param(s, label)
-                curv = curv if curv is not None else u""
-                if newv != curv:
-                    detail.append(u"{} {}→{}".format(label, curv or u"空", newv or u"空"))
-            if want_real and s.IsPlaceholder:
-                counts["toReal"] += 1
-                act = u"⬆️ 轉真實圖紙"
-            elif (not want_real) and (not s.IsPlaceholder):
-                counts["toPlace"] += 1
-                act = u"⚠️ 真實→預留(需刪除重建)"
-            elif detail:
-                counts["edit"] += 1
-                act = u"✏️ 修改"
-            else:
-                counts["same"] += 1
-                act = u"＝ 無變更"
-            rows.append((act, num or cur_num, nm or cur_nm, u"; ".join(detail)))
-        revit_only = [s for uid, s in by_uid.items() if uid not in seen]
-        return rows, counts, revit_only
+        for d in plan["new"]:
+            tag = u"🆕 新增" + (u"(真實)" if d["real"] else u"(預留)")
+            extra = u"; ".join([u"{}={}".format(k, v)
+                                for k, v in d.get("extra", {}).items() if v])
+            rows.append([tag, d["num"], d["name"], extra])
+        for d in plan["toReal"]:
+            s = d["sheet"]
+            rows.append([u"⬆️ 轉真實", d["num"] or s.SheetNumber,
+                         d["name"] or s.Name, self._edit_detail(d)])
+        for d in plan["edit"]:
+            s = d["sheet"]
+            rows.append([u"✏️ 修改", d["num"] or s.SheetNumber,
+                         d["name"] or s.Name, self._edit_detail(d)])
+        for d in plan["toPlace"]:
+            s = d["sheet"]
+            rows.append([u"⚠️ 真實→預留", s.SheetNumber, s.Name, u"刪原圖建預留"])
+        for d in plan["delete"]:
+            s = d["sheet"]
+            rows.append([u"🗑️ 刪除", s.SheetNumber, s.Name, u"Sheet 已移除"])
+        return rows
 
-    def _show_diff(self, records, diff, has_changes=False):
-        rows, counts, revit_only = diff
+    def _show_diff(self, plan, scope_note=u""):
         container = StackPanel()
         container.Margin = Thickness(10, 10, 10, 10)
+        rows = self._plan_to_rows(plan)
 
         summary = self._make_cell(
-            u"差異預覽（唯讀，尚未套用任何變更）\n"
-            u"Google Sheet 共 {} 筆　→　新增 {}／修改 {}／轉真實 {}／降預留刪除 {}／"
-            u"原id失效→新建 {}／無變更 {}\n"
-            u"刪除(Sheet 已移除)：{} 張（按⑤套用時會列清單再確認）".format(
-                len(records), counts["new"], counts["edit"], counts["toReal"],
-                counts["toPlace"], counts["orphan"], counts["same"], len(revit_only)),
+            (scope_note + u"\n" if scope_note else u"") +
+            u"差異預覽（唯讀，按下方「確認執行」才會套用）\n"
+            u"新增 {}／修改 {}／轉真實 {}／降預留刪除 {}／刪除 {}".format(
+                len(plan["new"]), len(plan["edit"]), len(plan["toReal"]),
+                len(plan["toPlace"]), len(plan["delete"])),
             bold=True)
         summary.TextWrapping = TextWrapping.Wrap
         summary.Margin = Thickness(6, 2, 6, 10)
         container.Children.Add(summary)
 
-        changed = [[r[0], r[1], r[2], r[3]] for r in rows
-                   if not r[0].startswith(u"＝")]
-        for s in revit_only:
-            changed.append([u"🗑️ 刪除(Sheet已移除)", s.SheetNumber or u"",
-                            s.Name or u"", u"此圖在 Google Sheet 已被刪除"])
-        if not changed:
+        if not rows:
             container.Children.Add(
                 self._make_cell(u"✅ 沒有差異，Revit 與 Google Sheet 一致。",
                                 bold=True, color=self.COLOR_SUCCESS))
         else:
             container.Children.Add(
-                self._build_grid_table([u"動作", u"圖號", u"圖名", u"細節"], changed))
-
-        # 確認執行鍵放在差異清單「下面」
-        if has_changes:
+                self._build_grid_table([u"動作", u"圖號", u"圖名", u"細節"], rows))
             exec_btn = Button()
             exec_btn.Content = u"✅ 確認執行（套用到 Revit）"
             exec_btn.Padding = Thickness(14, 8, 14, 8)
@@ -1753,24 +1756,45 @@ class BatchManageSheetsWindow(Window):
             cur = cur if cur is not None else u""
             if val != cur:
                 return True
+        for k, v in d.get("extra", {}).items():
+            if not v:
+                continue
+            cur = self._read_text_param(s, k)
+            cur = cur if cur is not None else u""
+            if v != cur:
+                return True
         return False
 
-    def _build_plan(self, records):
-        by_uid = {}
-        for s in DB.FilteredElementCollector(doc).OfClass(DB.ViewSheet).ToElements():
-            by_uid[s.UniqueId] = s
+    def _build_plan(self, records, scope_category=None, batch=None):
+        all_sheets = list(
+            DB.FilteredElementCollector(doc).OfClass(DB.ViewSheet).ToElements())
+        if scope_category is not None:
+            # 分表匯入：只在「該圖紙類別」範圍內比對(刪除也只限這個類別)
+            scoped = [s for s in all_sheets
+                      if (self._read_text_param(s, u"圖紙類別") or u"") == scope_category]
+            by_uid = dict((s.UniqueId, s) for s in scoped)
+        else:
+            by_uid = dict((s.UniqueId, s) for s in all_sheets)
         seen = set()
         plan = {"new": [], "edit": [], "toReal": [], "toPlace": [],
                 "delete": [], "orphan": 0}
+        # 標頭批次參數(分表用)：套用到該類別所有圖紙
+        batch_extra = {}
+        if batch:
+            for k in self.BATCH_PARAMS:
+                v = batch.get(k)
+                if v not in (None, u""):
+                    batch_extra[k] = unicode(v)
         for rec in records:
             uid = unicode(rec.get(u"UID") or u"").strip()
             d = {
                 "num": unicode(rec.get(u"圖紙號碼") or u""),
                 "name": unicode(rec.get(u"圖紙名稱") or u""),
-                "cat": unicode(rec.get(u"圖紙類別") or u""),
+                "cat": unicode(rec.get(u"圖紙類別") or (scope_category or u"")),
                 "drawer": unicode(rec.get(u"繪圖員") or u""),
                 "note": unicode(rec.get(u"修正備註") or u""),
                 "real": self._truthy(rec.get(u"是否為Revit出圖")),
+                "extra": dict(batch_extra),
             }
             if not uid:
                 plan["new"].append(d)
@@ -1789,7 +1813,7 @@ class BatchManageSheetsWindow(Window):
                 plan["toPlace"].append(d)
             elif self._needs_edit(s, d):
                 plan["edit"].append(d)
-        # Sheet 已把整列(含 id)刪除 → Revit 仍有 → 視為刪除（第3點）
+        # 範圍內：Sheet 已把整列(含 id)刪除 → Revit 仍有 → 視為刪除
         for uid, s in by_uid.items():
             if uid not in seen:
                 plan["delete"].append({"sheet": s})
@@ -1942,6 +1966,9 @@ class BatchManageSheetsWindow(Window):
                             self._set_param(sheet, u"繪圖員", d["drawer"])
                         if d["note"]:
                             self._set_param(sheet, u"修正備註", d["note"])
+                        for k, v in d.get("extra", {}).items():
+                            if v:
+                                self._set_param(sheet, k, v)
                     except Exception as ex:
                         fails.append((d.get("num"), u"套用欄位:" + unicode(ex)))
         except Exception as ex:
@@ -2194,16 +2221,23 @@ def main():
 
     elif win.result["mode"] == "import_apply":
         plan = win.result["plan"]
-        # 在 modal 視窗關閉「之後」才改模型，交易才不會被還原（第1點）
+        # 在 modal 視窗關閉「之後」才改模型，交易才不會被還原
         report, is_err, done = win._apply_plan(plan)
         output.print_md("# {} 匯入套用".format(u"❌" if is_err else u"✅"))
         output.print_md(report)
-        # 有新增(Sheet 上沒 id 的列) → 自動把最新狀態含新 UID 回寫 Sheet（第2點）
-        # 有新增/原id失效→新建/刪除重建 → UID 會變動，套用後自動回寫 Google Sheet
-        need_wb = not is_err and (done.get("new", 0) > 0
-                                  or done.get("toPlace", 0) > 0)
-        if need_wb:
-            res, err, n = win._do_export(plan["url"], plan["tab"])
+        role = plan.get("role") or "main"
+        main_tab = plan.get("mainTab") or plan.get("tab")
+        if not is_err and role == "sub":
+            # 分表匯入後：自動回寫總表 + 重新拆分，讓全部對齊（你的需求3）
+            r1, e1, _ = win._do_export(plan["url"], main_tab)
+            r2, e2, _ = win._do_split(plan["url"], main_tab)
+            if e1 or e2:
+                output.print_md("\n⚠ 自動同步總表/分表時有狀況：{} {}".format(e1 or "", e2 or ""))
+            else:
+                output.print_md("\n🔄 已自動回寫總表並重新拆分各分表（全部對齊）。")
+        elif not is_err and (done.get("new", 0) > 0 or done.get("toPlace", 0) > 0):
+            # 總表匯入：有新增/刪除重建 → UID 會變動，自動回寫
+            res, err, n = win._do_export(plan["url"], main_tab)
             if err:
                 output.print_md("\n⚠ 自動回寫 Google Sheet 失敗：{}".format(err))
             elif res and res.get("ok"):
