@@ -174,6 +174,7 @@ class BatchManageSheetsWindow(Window):
         self.result = None
         self.confirmed = False
         self._pending_plan = None  # 匯入預覽後暫存的套用計畫
+        self._pending_export = None  # 匯出預覽後暫存的匯出資訊
 
         # 表格輸入模式的列容器
         self.table_rows = []
@@ -1141,8 +1142,15 @@ class BatchManageSheetsWindow(Window):
         script_btn = Button()
         script_btn.Content = u"📄 最新腳本"
         script_btn.Padding = Thickness(10, 5, 10, 5)
+        script_btn.Margin = Thickness(0, 0, 8, 0)
         script_btn.Click += self._on_open_script
         doc_row.Children.Add(script_btn)
+
+        env_btn = Button()
+        env_btn.Content = u"🛠️ 建立環境"
+        env_btn.Padding = Thickness(10, 5, 10, 5)
+        env_btn.Click += self._on_build_env
+        doc_row.Children.Add(env_btn)
 
         Grid.SetRow(doc_row, 1)
         outer.Children.Add(doc_row)
@@ -1199,9 +1207,17 @@ class BatchManageSheetsWindow(Window):
         assign_btn = Button()
         assign_btn.Content = u"指派工作任務"
         assign_btn.Padding = Thickness(12, 6, 12, 6)
+        assign_btn.Margin = Thickness(0, 0, 8, 0)
         assign_btn.FontWeight = FontWeights.Bold
         assign_btn.Click += self._on_assign_tasks
         wbtn_row.Children.Add(assign_btn)
+
+        minutes_btn = Button()
+        minutes_btn.Content = u"👁 依會議紀錄編輯圖紙清單"
+        minutes_btn.Padding = Thickness(12, 6, 12, 6)
+        minutes_btn.FontWeight = FontWeights.Bold
+        minutes_btn.Click += self._on_edit_by_minutes
+        wbtn_row.Children.Add(minutes_btn)
 
         cfg_panel.Children.Add(wbtn_row)
 
@@ -1477,6 +1493,48 @@ class BatchManageSheetsWindow(Window):
         result, err = self._post_json(url, payload)
         return result, err, n
 
+    @staticmethod
+    def _norm(v):
+        if v is True:
+            return u"TRUE"
+        if v is False:
+            return u"FALSE"
+        if v is None:
+            return u""
+        return unicode(v).strip()
+
+    def _compute_export_diff(self, revit_recs, sheet_recs):
+        """比對『要寫出的 Revit 資料』與『Google Sheet 現況』，回傳 (新增, 修改, 移除)。"""
+        sheet_by_uid = {}
+        for r in sheet_recs:
+            u = unicode(r.get(u"UID") or u"").strip()
+            if u:
+                sheet_by_uid[u] = r
+        fields = [u"是否為Revit出圖", u"圖紙類別", u"圖紙號碼",
+                  u"圖紙名稱", u"繪圖員", u"修正備註"]
+        revit_uids = set()
+        added, modified, removed = [], [], []
+        for rec in revit_recs:
+            u = unicode(rec.get(u"UID") or u"").strip()
+            revit_uids.add(u)
+            num = unicode(rec.get(u"圖紙號碼") or u"")
+            nm = unicode(rec.get(u"圖紙名稱") or u"")
+            old = sheet_by_uid.get(u)
+            if old is None:
+                added.append([u"🆕 新增到表", num, nm, u""])
+            else:
+                diffs = [f for f in fields
+                         if self._norm(rec.get(f)) != self._norm(old.get(f))]
+                if diffs:
+                    modified.append([u"✏️ 修改", num, nm, u"、".join(diffs)])
+        for u, r in sheet_by_uid.items():
+            if u not in revit_uids:
+                removed.append([u"🗑️ 從表移除",
+                                unicode(r.get(u"圖紙號碼") or u""),
+                                unicode(r.get(u"圖紙名稱") or u""),
+                                u"Revit 已無此圖"])
+        return added, modified, removed
+
     def _on_write_gsheet(self, sender, args):
         url = (self.gs_url_box.Text or u"").strip()
         tab = (self.gs_tab_box.Text or u"").strip()
@@ -1486,84 +1544,92 @@ class BatchManageSheetsWindow(Window):
         if not tab:
             forms.alert(u"請填寫目標頁籤名稱。")
             return
-
-        recs, n = self._build_export_records()
-        ok = forms.alert(
-            u"即將把 {} 張圖紙寫入 Google Sheet。\n\n"
-            u"頁籤：{}\n"
-            u"程式會依『表頭名稱』找欄位寫入，並鎖定表頭列。\n\n要繼續嗎？".format(n, tab),
-            yes=True, no=True)
-        if not ok:
-            return
-
         save_gsheet_cfg({"url": url, "tab": tab, "secret": u""})
 
-        payload = {
-            "secret": u"",
-            "tab": tab,
-            "headerLabels": self.HEADER_LABELS,
-            "checkboxLabel": self.CHECKBOX_LABEL,
-            "dropdownLabels": self.DROPDOWN_LABELS,
-            "records": recs,
-            "updateDate": DateTime.Now.ToString("yyyyMMdd，HH:mm"),
-            "lockHeader": True,
-        }
-        body = json.dumps(payload)  # ensure_ascii -> 純 ASCII，中文以 \u 編碼
-
-        try:
-            from System.Net import (WebClient, ServicePointManager,
-                                    SecurityProtocolType)
-            from System.Text import Encoding
-            ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12
-            wc = WebClient()
-            wc.Encoding = Encoding.UTF8
-            wc.Headers.Add("Content-Type", "application/json")
-            resp = wc.UploadString(url, "POST", body)
-        except Exception as ex:
-            self._show_sync_msg(u"❌ 連線失敗：{}".format(ex), self.COLOR_ERROR)
+        # 先讀目前 Google Sheet，算出『匯出後會做的變更』給你預覽
+        revit_recs, n = self._build_export_records()
+        result, err = self._post_json(
+            url, {"secret": u"", "tab": tab, "action": "read",
+                  "headerLabels": self.HEADER_LABELS})
+        if err:
+            self._show_sync_msg(u"❌ 連線失敗：{}".format(err), self.COLOR_ERROR)
             return
+        sheet_recs = (result.get("records") if (result and result.get("ok")) else []) or []
 
-        try:
-            result = json.loads(resp)
-        except Exception:
-            result = None
+        added, modified, removed = self._compute_export_diff(revit_recs, sheet_recs)
+        self._pending_export = {"url": url, "tab": tab, "n": n}
+        self._show_export_diff(tab, n, added, modified, removed)
 
-        if result and result.get("ok"):
-            note = result.get("note") or u""
-            ver = result.get("apiVersion") or u"舊版(請重新部署新版本!)"
-            cbcol = result.get("checkboxCol")
-            cbinfo = (u"核取方塊欄=第 {} 欄".format(cbcol) if cbcol
-                      else u"⚠ 找不到核取方塊欄『{}』(表頭名稱要一致)".format(
-                          result.get("checkboxLabel", self.CHECKBOX_LABEL)))
-            msg = (u"✅ 寫入完成！　Google端程式版本：{}\n"
-                   u"表頭在第 {} 列，寫入 {} 張圖紙到「{}」。{}\n"
-                   u"{}\n"
-                   u"回到 Google Sheet 看看核取方塊/下拉。").format(
-                       ver, result.get("headerRow", u"?"), result.get("wrote", u"?"),
-                       result.get("tab", tab), cbinfo,
-                       u"🔒 表頭已鎖定（只有擁有者能改）。" if result.get("locked") else u"")
-            if note:
-                msg += u"\n\n⚠ 備註：{}".format(note)
-            # 第二步：選擇是否依「圖紙類別」拆成多個工作表
-            if forms.alert(u"匯出完成。\n\n要再依『圖紙類別』拆成多個工作表嗎？\n"
-                           u"（每個類別一個分頁、以類別命名）",
-                           yes=True, no=True):
-                sres, serr, _ = self._do_split(url, tab)
-                if serr:
-                    msg += u"\n\n⚠ 拆分失敗：{}".format(serr)
-                elif sres and sres.get("ok"):
-                    made = sres.get("splitTabs") or []
-                    if made:
-                        msg += u"\n\n🗂️ 已依圖紙類別拆出 {} 個工作表：\n{}".format(
-                            len(made), u"、".join(made))
-                    else:
-                        msg += u"\n\n（沒有可拆分的圖紙類別）"
-                else:
-                    msg += u"\n\n⚠ 拆分回應異常：{}".format(sres)
-            self._show_sync_msg(msg, self.COLOR_SUCCESS)
+    def _show_export_diff(self, tab, n, added, modified, removed):
+        container = StackPanel()
+        container.Margin = Thickness(10, 10, 10, 10)
+        summary = self._make_cell(
+            u"匯出預覽（尚未寫入，按下方「確認匯出」才會寫）\n"
+            u"目標頁籤：{}　共 {} 張圖紙\n"
+            u"新增到表 {}／修改 {}／從表移除 {}".format(
+                tab, n, len(added), len(modified), len(removed)),
+            bold=True)
+        summary.TextWrapping = TextWrapping.Wrap
+        summary.Margin = Thickness(6, 2, 6, 10)
+        container.Children.Add(summary)
+
+        rows = added + modified + removed
+        if not rows:
+            container.Children.Add(self._make_cell(
+                u"（內容與 Google Sheet 一致，匯出只會刷新更新時間）"))
         else:
-            err = result.get("error") if result else resp
-            self._show_sync_msg(u"❌ 寫入失敗：{}".format(err), self.COLOR_ERROR)
+            container.Children.Add(
+                self._build_grid_table([u"動作", u"圖號", u"圖名", u"細節"], rows))
+
+        exec_btn = Button()
+        exec_btn.Content = u"✅ 確認匯出（寫入 Google Sheet）"
+        exec_btn.Padding = Thickness(14, 8, 14, 8)
+        exec_btn.Margin = Thickness(0, 14, 0, 0)
+        exec_btn.HorizontalAlignment = HorizontalAlignment.Left
+        exec_btn.Background = self._brush(self.COLOR_PRIMARY)
+        exec_btn.Foreground = self._brush(self.COLOR_TEXT_LIGHT)
+        exec_btn.FontWeight = FontWeights.Bold
+        exec_btn.Click += self._on_export_execute
+        container.Children.Add(exec_btn)
+        self.sync_sv.Content = container
+
+    def _on_export_execute(self, sender, args):
+        pe = getattr(self, "_pending_export", None)
+        if not pe:
+            forms.alert(u"請先按「匯出」預覽。")
+            return
+        url, tab, n = pe["url"], pe["tab"], pe["n"]
+        result, err, _ = self._do_export(url, tab)
+        if err:
+            self._show_sync_msg(u"❌ 連線失敗：{}".format(err), self.COLOR_ERROR)
+            return
+        if not (result and result.get("ok")):
+            self._show_sync_msg(
+                u"❌ 寫入失敗：{}".format(result.get("error") if result else u"無回應"),
+                self.COLOR_ERROR)
+            return
+        ver = result.get("apiVersion") or u"舊版(請重新部署新版本!)"
+        msg = (u"✅ 匯出完成！　Google端程式版本：{}\n"
+               u"寫入 {} 張圖紙到「{}」。{}").format(
+                   ver, result.get("wrote", n), result.get("tab", tab),
+                   u"　🔒 表頭已鎖定。" if result.get("locked") else u"")
+        note = result.get("note") or u""
+        if note:
+            msg += u"\n⚠ 備註：{}".format(note)
+        # 第二步：選擇是否依「圖紙類別」拆成多個工作表
+        if forms.alert(u"匯出完成。\n\n要再依『圖紙類別』拆成多個工作表嗎？\n"
+                       u"（每個類別一個分頁、以類別命名）",
+                       yes=True, no=True):
+            sres, serr, _ = self._do_split(url, tab)
+            if serr:
+                msg += u"\n\n⚠ 拆分失敗：{}".format(serr)
+            elif sres and sres.get("ok"):
+                made = sres.get("splitTabs") or []
+                msg += (u"\n\n🗂️ 已拆出 {} 個分表：{}".format(len(made), u"、".join(made))
+                        if made else u"\n\n（沒有可拆分的圖紙類別）")
+            else:
+                msg += u"\n\n⚠ 拆分回應異常：{}".format(sres)
+        self._show_sync_msg(msg, self.COLOR_SUCCESS)
 
     # ---- 同步分頁：④ 匯入（從 Google Sheet 讀回 + 預覽差異，唯讀不套用）----
 
@@ -1860,6 +1926,17 @@ class BatchManageSheetsWindow(Window):
         forms.alert(u"「指派工作任務」功能開發中。\n\n"
                     u"未來按下後，會把『修正備註』欄裡的工作，\n"
                     u"分配給對應的『繪圖員』同事。\n（分配方式待討論）")
+
+    def _on_build_env(self, sender, args):
+        forms.alert(u"「建立環境」功能開發中（佔位）。\n\n"
+                    u"規劃：一鍵自動在 Revit 建立同步所需的圖紙文字參數\n"
+                    u"（圖紙類別/繪圖員/修正備註/審圖員/設計者/批准者/圖紙發布日期/校核2），\n"
+                    u"已存在的略過，並提示 Google 端設定。")
+
+    def _on_edit_by_minutes(self, sender, args):
+        forms.alert(u"「依會議紀錄編輯圖紙清單」功能開發中（佔位）。\n\n"
+                    u"規劃：貼上/讀取會議紀錄 → 用 AI 抓出每張圖的待辦 →\n"
+                    u"預覽 → 寫進對應圖紙的『修正備註』。\n（需接 Claude API）")
 
     def _docs_path(self, filename):
         """回傳擴充功能 docs 資料夾下的檔案完整路徑。"""
