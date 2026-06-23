@@ -39,7 +39,17 @@ function doPost(e) {
     if (body.action === 'split') {
       const made = splitByCategory(ss, tabName, records, labels, checkboxLabel,
                                    dropdownLabels, body.updateDate, body.lockHeader);
-      return json({ ok: true, apiVersion: 'v11', splitTabs: made });
+      return json({ ok: true, apiVersion: 'v12', splitTabs: made });
+    }
+
+    // 範圍限定同步：只回寫「某一圖紙類別(階段)」→ 取代總表中該類別的列、
+    // 只重建該類別分表；其他類別與分表完全不動（分表匯入後的自動回寫用）。
+    if (body.action === 'syncCategory') {
+      const synced = syncCategory(ss, tabName, body.category, records, labels,
+                                  checkboxLabel, dropdownLabels,
+                                  body.updateDate, body.lockHeader);
+      return json({ ok: true, apiVersion: 'v12', category: body.category,
+                    synced: synced });
     }
 
     // 一般匯出：寫主頁籤（並標記為「總表」）
@@ -49,7 +59,7 @@ function doPost(e) {
                                   dropdownLabels, body.updateDate, body.lockHeader);
     setRole(sh, 'main');
     return json({
-      ok: true, apiVersion: 'v11', tab: tabName, headerRow: res.headerRow,
+      ok: true, apiVersion: 'v12', tab: tabName, headerRow: res.headerRow,
       wrote: records.length, checkboxCol: res.checkboxCol,
       checkboxLabel: checkboxLabel, locked: res.locked, note: res.note
     });
@@ -207,6 +217,62 @@ function splitByCategory(ss, mainTabName, records, labels, checkboxLabel, dropdo
   return made;
 }
 
+// 範圍限定同步：只回寫某一圖紙類別(階段)。
+//   1) 總表：只取代屬於該類別的列，其他類別的列原封不動。
+//   2) 只重建該類別的分表；其他分表完全不碰。
+function syncCategory(ss, mainTabName, category, records, labels, checkboxLabel,
+                      dropdownLabels, updateDate, lockHeader) {
+  // 1) 總表
+  let mainSh = ss.getSheetByName(mainTabName);
+  if (!mainSh || getRole(mainSh) !== 'main') {
+    const mn = findMainTabName(ss);
+    if (mn) mainSh = ss.getSheetByName(mn);
+  }
+  if (mainSh) {
+    replaceCategoryRowsInMain(mainSh, category, records, labels, checkboxLabel,
+                              dropdownLabels, updateDate, lockHeader);
+    setRole(mainSh, 'main');
+  }
+  // 2) 只重建該類別分表
+  if (category) {
+    let subSh = ss.getSheetByName(category);
+    if (!subSh) subSh = ss.insertSheet(category);
+    const bp = {};
+    BAF_BATCH_LABELS.forEach(function (lbl) {
+      bp[lbl] = (records[0] && records[0][lbl] != null) ? records[0][lbl] : '';
+    });
+    writeSubSheet(subSh, records, labels, checkboxLabel, dropdownLabels,
+                  updateDate, lockHeader, bp);
+    setRole(subSh, 'sub');
+  }
+  return [category];
+}
+
+// 在「總表」中只取代某類別的列：保留其他類別的列(用表上現值)，
+// 把本類別的列換成傳入的 records(來自 Revit)，順序儘量維持。
+function replaceCategoryRowsInMain(sh, category, records, labels, checkboxLabel,
+                                   dropdownLabels, updateDate, lockHeader) {
+  const existing = readSheet(sh, labels);
+  if (!existing || !existing.ok) return false;  // 讀不到表頭 → 不動總表(避免誤刪)
+  const combined = [];
+  let inserted = false;
+  (existing.records || []).forEach(function (r) {
+    if (String(r['圖紙類別'] || '').trim() === category) {
+      if (!inserted) {                       // 在本類別第一筆的位置插入新列
+        records.forEach(function (nr) { combined.push(nr); });
+        inserted = true;
+      }
+      // 丟掉舊的本類別列
+    } else {
+      combined.push(r);                       // 其他類別維持原值原順序
+    }
+  });
+  if (!inserted) records.forEach(function (nr) { combined.push(nr); });
+  writeIndexToSheet(sh, combined, labels, checkboxLabel, dropdownLabels,
+                    updateDate, lockHeader);
+  return true;
+}
+
 // 分表：整頁乾淨重建。版面(從 A 欄起)：
 //   第1列 更新時間；第2~6列 批次參數(label在A、值在B，可編輯)；空一列；欄位表頭；資料。
 //   表頭(含批次參數)全部凍結；只鎖「欄位表頭那一列」，批次參數值仍可編輯。
@@ -220,15 +286,20 @@ function writeSubSheet(sh, records, labels, checkboxLabel, dropdownLabels, updat
     if (prots[i].getDescription() === 'BaF表頭鎖定') prots[i].remove();
   }
 
-  // 第1列：更新時間
-  sh.getRange(1, 1).setValue('更新時間：');
-  if (updateDate) sh.getRange(1, 2).setValue(updateDate);
+  // 固定參數/更新時間放在「圖紙號碼」欄(名稱)與「圖紙名稱」欄(值)的上方，
+  // 因為這兩欄永遠不會被隱藏；其他欄位使用者可自行隱藏不受影響。
+  const lblCol = (labels.indexOf('圖紙號碼') >= 0) ? labels.indexOf('圖紙號碼') + 1 : 1;
+  const valCol = (labels.indexOf('圖紙名稱') >= 0) ? labels.indexOf('圖紙名稱') + 1 : 2;
 
-  // 批次參數區（label 在 A、值在 B）
+  // 第1列：更新時間（名稱在「圖紙號碼」欄、值在「圖紙名稱」欄）
+  sh.getRange(1, lblCol).setValue('更新時間：');
+  if (updateDate) sh.getRange(1, valCol).setValue(updateDate);
+
+  // 特定階段固定參數區（名稱在「圖紙號碼」欄、值在「圖紙名稱」欄、各佔一格）
   let r = 2;
   BAF_BATCH_LABELS.forEach(function (lbl) {
-    sh.getRange(r, 1).setValue(lbl + '：');
-    sh.getRange(r, 2).setValue((batchParams && batchParams[lbl] != null) ? batchParams[lbl] : '');
+    sh.getRange(r, lblCol).setValue(lbl + '：');
+    sh.getRange(r, valCol).setValue((batchParams && batchParams[lbl] != null) ? batchParams[lbl] : '');
     r++;
   });
   const headerRow = r + 1;   // 空一列後放欄位表頭
@@ -327,9 +398,15 @@ function readSheet(sh, labels) {
   const category = (role === 'sub') ? sh.getName() : '';
   const batchParams = {};
   if (role === 'sub') {
+    const valCol = colOf['圖紙名稱'];  // 值放在「圖紙名稱」欄
     BAF_BATCH_LABELS.forEach(function (lbl) {
       const loc = findCell(sh, lbl, 10, lastCol);
-      batchParams[lbl] = loc ? sh.getRange(loc.row, loc.col + 1).getValue() : '';
+      if (loc) {
+        const vcol = valCol || (loc.col + 1);
+        batchParams[lbl] = sh.getRange(loc.row, vcol).getValue();
+      } else {
+        batchParams[lbl] = '';
+      }
     });
   }
   return {

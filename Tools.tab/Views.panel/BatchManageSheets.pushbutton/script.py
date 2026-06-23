@@ -1537,6 +1537,35 @@ class BatchManageSheetsWindow(Window):
         result, err = self._post_json(url, payload)
         return result, err, n
 
+    def _build_export_records_for_category(self, category):
+        """只取某一圖紙類別(階段)的匯出 records。"""
+        recs, _ = self._build_export_records()
+        cat = unicode(category or u"")
+        scoped = [r for r in recs
+                  if unicode(r.get(u"圖紙類別") or u"") == cat]
+        return scoped
+
+    def _do_sync_category(self, url, main_tab, category):
+        """範圍限定回寫：只更新總表中該類別的列、只重建該類別分表。
+
+        其他階段與分表完全不動。回傳 (result, err, 該類別張數)。
+        """
+        recs = self._build_export_records_for_category(category)
+        payload = {
+            "secret": u"",
+            "tab": main_tab,
+            "action": "syncCategory",
+            "category": category,
+            "headerLabels": self.HEADER_LABELS,
+            "checkboxLabel": self.CHECKBOX_LABEL,
+            "dropdownLabels": self.DROPDOWN_LABELS,
+            "records": recs,
+            "updateDate": DateTime.Now.ToString("yyyyMMdd，HH:mm"),
+            "lockHeader": True,
+        }
+        result, err = self._post_json(url, payload)
+        return result, err, len(recs)
+
     @staticmethod
     def _norm(v):
         if v is True:
@@ -1719,6 +1748,16 @@ class BatchManageSheetsWindow(Window):
             return False
         return unicode(v).strip().upper() in (u"TRUE", u"1", u"V", u"X", u"是", u"YES")
 
+    def _build_uid_sheet_map(self):
+        """UID → (圖號, 圖名)，供匯入資料檢查顯示對應的現有圖紙。"""
+        m = {}
+        for s in DB.FilteredElementCollector(doc).OfClass(DB.ViewSheet).ToElements():
+            try:
+                m[s.UniqueId] = (s.SheetNumber or u"", s.Name or u"")
+            except Exception:
+                pass
+        return m
+
     def _on_import_preview(self, sender, args):
         self._pending_plan = None
         url = (self.gs_url_box.Text or u"").strip()
@@ -1743,6 +1782,18 @@ class BatchManageSheetsWindow(Window):
             forms.alert(u"Google Sheet 讀不到任何資料列，為避免誤刪已中止。\n"
                         u"請確認頁籤名稱正確、表格有資料。")
             return
+
+        # 先檢查 UID 異常（有 UID 但無值 / 重複 UID）→ 跳對話框讓使用者處理
+        if _ImportCleanupWindow.has_issues(records):
+            dlg = _ImportCleanupWindow(records, self._build_uid_sheet_map())
+            dlg.ShowDialog()
+            if not dlg.confirmed:
+                return  # 取消匯入
+            records = dlg.cleaned_records
+            if not records:
+                forms.alert(u"處理後沒有可匯入的列，已中止。")
+                return
+
         resolved_dup = False
         if self._check_dup_numbers(records):
             # 跳出對話框，讓使用者就地把重複圖號改掉（直接改 records）
@@ -1771,6 +1822,7 @@ class BatchManageSheetsWindow(Window):
         plan["tab"] = tab
         plan["role"] = role
         plan["mainTab"] = main_tab
+        plan["category"] = category
         plan["resolvedDup"] = resolved_dup
 
         n_changes = (len(plan["new"]) + len(plan["edit"]) + len(plan["toReal"])
@@ -2588,6 +2640,234 @@ class _DupResolveWindow(Window):
         self.Close()
 
 
+class _ImportCleanupWindow(Window):
+    """匯入前資料檢查：擋下並條列「有 UID 但無值」與「重複 UID」的列。
+
+    勾選 = 這列不要匯入（移除）。每個 UID 最多只能保留 1 列。
+    某 UID 若一列都不留 → 對應的 Revit 圖紙會被刪除（之後刪除確認視窗會再列一次）。
+    確定後把保留的列放在 self.cleaned_records。
+    """
+
+    @staticmethod
+    def _uid(rec):
+        return unicode(rec.get(u"UID") or u"").strip()
+
+    @staticmethod
+    def _is_blank(rec):
+        num = unicode(rec.get(u"圖紙號碼") or u"").strip()
+        name = unicode(rec.get(u"圖紙名稱") or u"").strip()
+        return (not num) and (not name)
+
+    @classmethod
+    def has_issues(cls, records):
+        seen = {}
+        for r in records:
+            u = cls._uid(r)
+            if u:
+                seen[u] = seen.get(u, 0) + 1
+        for r in records:
+            u = cls._uid(r)
+            if u and cls._is_blank(r):
+                return True            # 有 UID 但無值
+            if u and seen[u] > 1:
+                return True            # 重複 UID
+        return False
+
+    def __init__(self, records, uid_to_sheet):
+        self.confirmed = False
+        self.records = records
+        self.cleaned_records = list(records)
+        self._uid_to_sheet = uid_to_sheet or {}
+        self._row_checks = []  # (checkbox, rec)
+        self._build_ui()
+
+    def _ctx(self, rec):
+        """該列 UID 對應現有 Revit 圖紙的圖號/圖名（沒有則顯示提示）。"""
+        info = self._uid_to_sheet.get(self._uid(rec))
+        if info:
+            return u"{}  {}".format(info[0], info[1])
+        return u"（無對應的現有圖紙）"
+
+    def _build_ui(self):
+        self.Title = u"匯入資料檢查（UID 異常）"
+        self.Width = 720
+        self.Height = 620
+        self.WindowStartupLocation = WindowStartupLocation.CenterScreen
+        self.Background = _brush((245, 245, 250))
+
+        root = Grid()
+        root.Margin = Thickness(16, 14, 16, 14)
+        root.RowDefinitions.Add(RowDefinition(Height=GridLength(1, GridUnitType.Auto)))
+        root.RowDefinitions.Add(RowDefinition(Height=GridLength(1, GridUnitType.Star)))
+        root.RowDefinitions.Add(RowDefinition(Height=GridLength(1, GridUnitType.Auto)))
+        root.RowDefinitions.Add(RowDefinition(Height=GridLength(1, GridUnitType.Auto)))
+
+        intro = TextBlock()
+        intro.Text = (u"Google Sheet 有異常的列，匯入前請先處理。\n"
+                      u"勾選 = 這列不要匯入（移除）。每個 UID 只能保留 1 列；\n"
+                      u"某 UID 若一列都不保留，對應的 Revit 圖紙會被刪除（之後會再確認一次）。")
+        intro.TextWrapping = TextWrapping.Wrap
+        intro.FontSize = 13
+        intro.FontWeight = FontWeights.Bold
+        intro.Foreground = _brush((180, 90, 0))
+        intro.Margin = Thickness(0, 0, 0, 10)
+        Grid.SetRow(intro, 0)
+        root.Children.Add(intro)
+
+        sv = ScrollViewer()
+        sv.VerticalScrollBarVisibility = ScrollBarVisibility.Visible
+        sv.Background = _brush((255, 255, 255))
+        sv.BorderBrush = _brush((200, 205, 215))
+        sv.BorderThickness = Thickness(1)
+        sv.Padding = Thickness(8, 8, 8, 8)
+        panel = StackPanel()
+        panel.Orientation = Orientation.Vertical
+
+        # 分類：重複 UID 群組 / 空白列(UID 唯一)
+        uid_count = {}
+        order = []
+        for r in self.records:
+            u = self._uid(r)
+            if u:
+                if u not in uid_count:
+                    uid_count[u] = 0
+                    order.append(u)
+                uid_count[u] += 1
+
+        # 1) 重複 UID
+        dup_uids = [u for u in order if uid_count[u] > 1]
+        if dup_uids:
+            panel.Children.Add(self._section_header(
+                u"重複 UID（同一 UID 多列；每個 UID 只能保留 1 列）"))
+            for u in dup_uids:
+                group = [r for r in self.records if self._uid(r) == u]
+                gh = TextBlock()
+                gh.Text = u"UID {}…（{} 列）　對應：{}".format(
+                    u[:8], len(group), self._ctx(group[0]))
+                gh.FontWeight = FontWeights.Bold
+                gh.Margin = Thickness(2, 8, 2, 4)
+                gh.Foreground = _brush((30, 30, 40))
+                panel.Children.Add(gh)
+                # 預設保留第一筆非空白列，其餘勾選移除
+                keep_idx = next((i for i, r in enumerate(group)
+                                 if not self._is_blank(r)), 0)
+                for i, r in enumerate(group):
+                    panel.Children.Add(self._make_row(r, default_remove=(i != keep_idx)))
+
+        # 2) 空白列（UID 唯一、圖號圖名皆空）
+        blank_unique = [r for r in self.records
+                        if self._uid(r) and self._is_blank(r) and uid_count[self._uid(r)] == 1]
+        if blank_unique:
+            panel.Children.Add(self._section_header(
+                u"空白列（有 UID、無圖號圖名）；勾選＝刪除對應圖紙"))
+            for r in blank_unique:
+                panel.Children.Add(self._make_row(r, default_remove=False))
+
+        sv.Content = panel
+        Grid.SetRow(sv, 1)
+        root.Children.Add(sv)
+
+        self.err_text = TextBlock()
+        self.err_text.Foreground = _brush((220, 53, 69))
+        self.err_text.TextWrapping = TextWrapping.Wrap
+        self.err_text.Margin = Thickness(2, 8, 2, 0)
+        Grid.SetRow(self.err_text, 2)
+        root.Children.Add(self.err_text)
+
+        btns = StackPanel()
+        btns.Orientation = Orientation.Horizontal
+        btns.HorizontalAlignment = HorizontalAlignment.Right
+        btns.Margin = Thickness(0, 10, 0, 0)
+        ok = Button()
+        ok.Content = u"確定"
+        ok.Padding = Thickness(16, 6, 16, 6)
+        ok.Margin = Thickness(0, 0, 8, 0)
+        ok.Background = _brush((99, 102, 241))
+        ok.Foreground = _brush((255, 255, 255))
+        ok.FontWeight = FontWeights.Bold
+        ok.Click += self._on_ok
+        btns.Children.Add(ok)
+        cancel = Button()
+        cancel.Content = u"取消匯入"
+        cancel.Padding = Thickness(16, 6, 16, 6)
+        cancel.Click += self._on_cancel
+        btns.Children.Add(cancel)
+        Grid.SetRow(btns, 3)
+        root.Children.Add(btns)
+        self.Content = root
+
+    def _section_header(self, text):
+        tb = TextBlock()
+        tb.Text = text
+        tb.FontWeight = FontWeights.Bold
+        tb.FontSize = 13
+        tb.Margin = Thickness(0, 6, 0, 2)
+        tb.Foreground = _brush((99, 102, 241))
+        return tb
+
+    def _make_row(self, rec, default_remove):
+        row = Grid()
+        row.Margin = Thickness(0, 1, 0, 1)
+        row.ColumnDefinitions.Add(ColumnDefinition(Width=GridLength(50)))
+        row.ColumnDefinitions.Add(ColumnDefinition(Width=GridLength(140)))
+        row.ColumnDefinitions.Add(ColumnDefinition(Width=GridLength(1, GridUnitType.Star)))
+        row.ColumnDefinitions.Add(ColumnDefinition(Width=GridLength(90)))
+
+        cb = CheckBox()
+        cb.IsChecked = bool(default_remove)
+        cb.VerticalAlignment = VerticalAlignment.Center
+        cb.HorizontalAlignment = HorizontalAlignment.Center
+        Grid.SetColumn(cb, 0)
+        row.Children.Add(cb)
+        self._row_checks.append((cb, rec))
+
+        num = TextBlock()
+        num.Text = unicode(rec.get(u"圖紙號碼") or u"") or u"（空）"
+        num.VerticalAlignment = VerticalAlignment.Center
+        num.Foreground = _brush((30, 30, 40))
+        Grid.SetColumn(num, 1)
+        row.Children.Add(num)
+
+        nm = TextBlock()
+        nm.Text = unicode(rec.get(u"圖紙名稱") or u"") or u"（空）"
+        nm.VerticalAlignment = VerticalAlignment.Center
+        nm.TextTrimming = TextTrimming.CharacterEllipsis
+        nm.Foreground = _brush((90, 95, 110))
+        Grid.SetColumn(nm, 2)
+        row.Children.Add(nm)
+
+        ut = TextBlock()
+        ut.Text = self._uid(rec)[:8]
+        ut.VerticalAlignment = VerticalAlignment.Center
+        ut.Foreground = _brush((150, 155, 165))
+        ut.FontSize = 11
+        Grid.SetColumn(ut, 3)
+        row.Children.Add(ut)
+        return row
+
+    def _on_ok(self, sender, args):
+        drop = set(id(rec) for cb, rec in self._row_checks if cb.IsChecked)
+        kept = [r for r in self.records if id(r) not in drop]
+        # 每個 UID 最多保留 1 列
+        counts = {}
+        for r in kept:
+            u = self._uid(r)
+            if u:
+                counts[u] = counts.get(u, 0) + 1
+        still = sorted([u[:8] for u, c in counts.items() if c > 1])
+        if still:
+            self.err_text.Text = (u"這些 UID 仍保留超過 1 列，請再勾選移除："
+                                  + u"、".join(still))
+            return
+        self.cleaned_records = kept
+        self.confirmed = True
+        self.Close()
+
+    def _on_cancel(self, sender, args):
+        self.confirmed = False
+        self.Close()
+
+
 # ---------------------------------------------------------------------------
 # 執行（Revit）
 # ---------------------------------------------------------------------------
@@ -2963,8 +3243,8 @@ def _ensure_sheet_schedule(document, want_params):
 # 主流程
 # ---------------------------------------------------------------------------
 
-def main():
-    # 開新視窗前，先關掉上一個還開著的（用 AppDomain 跨次記住）
+def _open_manager_window(initial_tab=None):
+    """開啟管理器視窗（可指定初始分頁），回傳關閉後的視窗物件。"""
     from System import AppDomain
     _WKEY = "BAF_SheetMgr_Window"
     prev = AppDomain.CurrentDomain.GetData(_WKEY)
@@ -2979,100 +3259,142 @@ def main():
     existing_sheets = get_existing_sheets(doc)
 
     win = BatchManageSheetsWindow(title_blocks, existing_sheets)
+    if initial_tab is not None:
+        try:
+            win.tabs.SelectedIndex = initial_tab
+        except Exception:
+            pass
     AppDomain.CurrentDomain.SetData(_WKEY, win)
     win.ShowDialog()
     # 只有當記錄的還是自己時才清掉（避免清掉後開的新視窗）
     if AppDomain.CurrentDomain.GetData(_WKEY) is win:
         AppDomain.CurrentDomain.SetData(_WKEY, None)
+    return win
 
-    if not win.confirmed:
-        script.exit()
-    
-    if win.result["mode"] == "create":
-        created, failed = create_sheets(win.result, doc)
-        output.print_md("# ✅ 批次新增圖紙完成")
-        output.print_md("- 成功: **{}** 張".format(len(created)))
-        output.print_md("- 失敗: **{}** 張".format(len(failed)))
-        if created:
-            output.print_md("\n## 已建立")
-            for num, name in created:
-                output.print_md("- `{}` - {}".format(num, name))
-        if failed:
-            output.print_md("\n## 失敗")
-            for num, name, reason in failed:
-                output.print_md("- `{}` - {}: {}".format(num, name, reason))
-    
-    elif win.result["mode"] == "edit":
-        edited, failed = edit_sheets(win.result, doc)
-        output.print_md("# ✅ 批次編輯圖紙完成")
-        output.print_md("- 成功: **{}** 張".format(len(edited)))
-        output.print_md("- 失敗: **{}** 張".format(len(failed)))
-        if edited:
-            output.print_md("\n## 已變更")
-            for old_num, old_name, new_num, new_name in edited:
-                output.print_md("- `{} | {}` → `{} | {}`".format(old_num, old_name, new_num, new_name))
-        if failed:
-            output.print_md("\n## 失敗")
-            for old_num, reason in failed:
-                output.print_md("- `{}`: {}".format(old_num, reason))
 
-    elif win.result["mode"] == "build_env":
-        created_shared, created_project, failed, sched_msg = build_env(win.result, doc)
-        have = win.result.get("have") or []
-        output.print_md("# 🛠️ 建立同步環境")
-        output.print_md("- 沿用公司共用參數: **{}** 個".format(len(created_shared)))
-        output.print_md("- 新建專案參數: **{}** 個".format(len(created_project)))
-        output.print_md("- 已存在略過: **{}** 個".format(len(have)))
-        output.print_md("- 失敗: **{}** 個".format(len(failed)))
-        if created_shared:
-            output.print_md("\n## 沿用公司共用參數（保留 GUID）")
-            for name in created_shared:
-                output.print_md("- `{}`".format(name))
-        if created_project:
-            output.print_md("\n## 新建專案參數")
-            for name in created_project:
-                output.print_md("- `{}`".format(name))
-        if have:
-            output.print_md("\n## 已存在（略過）")
-            for name in have:
-                output.print_md("- `{}`".format(name))
-        if failed:
-            output.print_md("\n## 失敗")
-            for name, reason in failed:
-                output.print_md("- `{}`: {}".format(name, reason))
-        if sched_msg:
-            output.print_md("\n## 圖紙明細表")
-            output.print_md("- {}".format(sched_msg))
-        if not failed:
-            output.print_md("\n✅ 環境就緒，可在圖紙屬性填寫並與 Google Sheet 同步。"
-                            "（本步驟未更動 Google Sheet）")
+def _prompt_sync_after_change():
+    """新增/編輯/刪除圖紙後，詢問是否要與 Google Sheet 同步。"""
+    return forms.alert(
+        u"Revit 圖紙清單已更新。\n\n要現在與 Google Sheet 同步嗎？\n"
+        u"（選「是」會切換到「Google Sheet 同步」分頁；選「否」則只更新 Revit）",
+        yes=True, no=True)
 
-    elif win.result["mode"] == "import_apply":
-        plan = win.result["plan"]
-        # 在 modal 視窗關閉「之後」才改模型，交易才不會被還原
-        report, is_err, done = win._apply_plan(plan)
-        output.print_md("# {} 匯入套用".format(u"❌" if is_err else u"✅"))
-        output.print_md(report)
-        role = plan.get("role") or "main"
-        main_tab = plan.get("mainTab") or plan.get("tab")
-        if not is_err and role == "sub":
-            # 分表匯入後：自動回寫總表 + 重新拆分，讓全部對齊（你的需求3）
-            r1, e1, _ = win._do_export(plan["url"], main_tab)
-            r2, e2, _ = win._do_split(plan["url"], main_tab)
-            if e1 or e2:
-                output.print_md("\n⚠ 自動同步總表/分表時有狀況：{} {}".format(e1 or "", e2 or ""))
-            else:
-                output.print_md("\n🔄 已自動回寫總表並重新拆分各分表（全部對齊）。")
-        elif not is_err and (done.get("new", 0) > 0 or done.get("toPlace", 0) > 0
-                             or plan.get("resolvedDup")):
-            # 總表匯入：有新增/刪除重建(UID 變動) 或 解決過重複圖號 → 自動回寫
-            res, err, n = win._do_export(plan["url"], main_tab)
-            if err:
-                output.print_md("\n⚠ 自動回寫 Google Sheet 失敗：{}".format(err))
-            elif res and res.get("ok"):
-                output.print_md("\n🔄 已自動回寫 Google Sheet（更新變動/新建的 UID、已修正的重複圖號）。")
-            else:
-                output.print_md("\n⚠ 自動回寫回應異常：{}".format(res))
+
+def main():
+    next_tab = None
+    while True:
+        win = _open_manager_window(next_tab)
+        next_tab = None
+
+        if not win.confirmed:
+            script.exit()
+            return
+
+        mode = win.result["mode"]
+
+        if mode == "create":
+            created, failed = create_sheets(win.result, doc)
+            output.print_md("# ✅ 批次新增圖紙完成")
+            output.print_md("- 成功: **{}** 張".format(len(created)))
+            output.print_md("- 失敗: **{}** 張".format(len(failed)))
+            if created:
+                output.print_md("\n## 已建立")
+                for num, name in created:
+                    output.print_md("- `{}` - {}".format(num, name))
+            if failed:
+                output.print_md("\n## 失敗")
+                for num, name, reason in failed:
+                    output.print_md("- `{}` - {}: {}".format(num, name, reason))
+            if created and _prompt_sync_after_change():
+                next_tab = BatchManageSheetsWindow.MODE_SYNC
+                continue
+            return
+
+        elif mode == "edit":
+            edited, failed = edit_sheets(win.result, doc)
+            output.print_md("# ✅ 批次編輯圖紙完成")
+            output.print_md("- 成功: **{}** 張".format(len(edited)))
+            output.print_md("- 失敗: **{}** 張".format(len(failed)))
+            if edited:
+                output.print_md("\n## 已變更")
+                for old_num, old_name, new_num, new_name in edited:
+                    output.print_md("- `{} | {}` → `{} | {}`".format(old_num, old_name, new_num, new_name))
+            if failed:
+                output.print_md("\n## 失敗")
+                for old_num, reason in failed:
+                    output.print_md("- `{}`: {}".format(old_num, reason))
+            if edited and _prompt_sync_after_change():
+                next_tab = BatchManageSheetsWindow.MODE_SYNC
+                continue
+            return
+
+        elif mode == "build_env":
+            created_shared, created_project, failed, sched_msg = build_env(win.result, doc)
+            have = win.result.get("have") or []
+            output.print_md("# 🛠️ 建立同步環境")
+            output.print_md("- 沿用公司共用參數: **{}** 個".format(len(created_shared)))
+            output.print_md("- 新建專案參數: **{}** 個".format(len(created_project)))
+            output.print_md("- 已存在略過: **{}** 個".format(len(have)))
+            output.print_md("- 失敗: **{}** 個".format(len(failed)))
+            if created_shared:
+                output.print_md("\n## 沿用公司共用參數（保留 GUID）")
+                for name in created_shared:
+                    output.print_md("- `{}`".format(name))
+            if created_project:
+                output.print_md("\n## 新建專案參數")
+                for name in created_project:
+                    output.print_md("- `{}`".format(name))
+            if have:
+                output.print_md("\n## 已存在（略過）")
+                for name in have:
+                    output.print_md("- `{}`".format(name))
+            if failed:
+                output.print_md("\n## 失敗")
+                for name, reason in failed:
+                    output.print_md("- `{}`: {}".format(name, reason))
+            if sched_msg:
+                output.print_md("\n## 圖紙明細表")
+                output.print_md("- {}".format(sched_msg))
+            if not failed:
+                output.print_md("\n✅ 環境就緒，可在圖紙屬性填寫並與 Google Sheet 同步。"
+                                "（本步驟未更動 Google Sheet）")
+            return
+
+        elif mode == "import_apply":
+            plan = win.result["plan"]
+            # 在 modal 視窗關閉「之後」才改模型，交易才不會被還原
+            report, is_err, done = win._apply_plan(plan)
+            output.print_md("# {} 匯入套用".format(u"❌" if is_err else u"✅"))
+            output.print_md(report)
+            role = plan.get("role") or "main"
+            main_tab = plan.get("mainTab") or plan.get("tab")
+            if not is_err and role == "sub":
+                # 分表匯入後：範圍限定回寫 —— 只更新總表中「該階段」的列、
+                # 只重建「該階段」分表；其他階段與分表完全不動（避免誤刪/覆蓋）。
+                cat = plan.get("category") or u""
+                res, err, _ = win._do_sync_category(plan["url"], main_tab, cat)
+                if err:
+                    output.print_md("\n⚠ 自動回寫（範圍：{}）失敗：{}".format(cat, err))
+                elif res and res.get("ok"):
+                    output.print_md(
+                        "\n🔄 已只回寫「{}」階段：更新總表中該階段的列、重建該階段分表"
+                        "（其他階段與分表未變動）。".format(cat))
+                else:
+                    output.print_md("\n⚠ 自動回寫回應異常：{}".format(res))
+            elif not is_err and (done.get("new", 0) > 0 or done.get("toPlace", 0) > 0
+                                 or plan.get("resolvedDup")):
+                # 總表匯入：有新增/刪除重建(UID 變動) 或 解決過重複圖號 → 自動回寫
+                res, err, n = win._do_export(plan["url"], main_tab)
+                if err:
+                    output.print_md("\n⚠ 自動回寫 Google Sheet 失敗：{}".format(err))
+                elif res and res.get("ok"):
+                    output.print_md("\n🔄 已自動回寫 Google Sheet（更新變動/新建的 UID、已修正的重複圖號）。")
+                else:
+                    output.print_md("\n⚠ 自動回寫回應異常：{}".format(res))
+            return
+
+        # 其他模式：處理完就結束
+        return
 
 
 if __name__ == '__main__':
