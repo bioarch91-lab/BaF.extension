@@ -43,6 +43,50 @@ import json
 doc = revit.doc
 output = script.get_output()
 
+
+# 部分同步參數其實是 Revit「內建」圖紙參數（名稱依語言/範本用字可能略有差異，
+# 例如「圖紙發佈日期(佈)」vs 我們用的「圖紙發布日期(布)」）。
+# 用 BuiltInParameter 對應，偵測/讀/寫/明細表都優先用內建，避免比錯字、建出重複。
+def _resolve_bip(bipname):
+    try:
+        return getattr(DB.BuiltInParameter, bipname)
+    except Exception:
+        return None
+
+
+BUILTIN_PARAM_MAP = {}
+for _logical, _bipname in (
+        (u"繪圖員", "SHEET_DRAWN_BY"),
+        (u"審圖員", "SHEET_CHECKED_BY"),
+        (u"設計者", "SHEET_DESIGNED_BY"),
+        (u"批准者", "SHEET_APPROVED_BY"),
+        (u"圖紙發布日期", "SHEET_ISSUE_DATE")):
+    _b = _resolve_bip(_bipname)
+    if _b is not None:
+        BUILTIN_PARAM_MAP[_logical] = _b
+
+
+def _lookup_sheet_param(sheet, pname):
+    """取得圖紙參數。
+
+    對照表內的名稱(內建圖紙參數)一律優先用 BuiltInParameter，
+    避免被同名的自訂/誤建參數攔截(例如先前誤建的空白「圖紙發布日期」)。
+    其餘名稱用一般 LookupParameter。
+    """
+    bip = BUILTIN_PARAM_MAP.get(pname)
+    if bip is not None:
+        try:
+            p = sheet.get_Parameter(bip)
+            if p is not None:
+                return p
+        except Exception:
+            pass
+    try:
+        return sheet.LookupParameter(pname)
+    except Exception:
+        return None
+
+
 # Google Sheet 寫入設定（存在本機，不進 git，避免 URL 外流）
 GSHEET_CFG = os.path.join(os.getenv("APPDATA") or u"", "pyRevit", "baf_gsheet_config.json")
 
@@ -1247,7 +1291,7 @@ class BatchManageSheetsWindow(Window):
 
     def _read_text_param(self, sheet, pname):
         """讀參數文字值。None = 此圖紙沒有這個參數；'' = 有參數但空值。"""
-        p = sheet.LookupParameter(pname)
+        p = _lookup_sheet_param(sheet, pname)
         if p is None:
             return None
         try:
@@ -1316,9 +1360,9 @@ class BatchManageSheetsWindow(Window):
         for s in sheets:
             if s.IsPlaceholder:
                 n_place += 1
-                state = u"預留"
+                state = u"僅文字資訊"
             else:
-                state = u"真實"
+                state = u"真實圖紙"
             row = [s.UniqueId[:8], state, s.SheetNumber or u"", s.Name or u""]
             for pn in params:
                 v = self._read_text_param(s, pn)
@@ -1328,7 +1372,7 @@ class BatchManageSheetsWindow(Window):
                     row.append(v)  # 空值就留白
             rows.append(row)
         summary = self._make_cell(
-            u"共 {} 張圖紙　（真實 {} ／ 預留 {}）".format(
+            u"共 {} 張圖紙　（真實圖紙 {} ／ 僅文字資訊 {}）".format(
                 len(sheets), len(sheets) - n_place, n_place),
             bold=True)
         summary.Margin = Thickness(6, 2, 6, 10)
@@ -1554,6 +1598,21 @@ class BatchManageSheetsWindow(Window):
         if err:
             self._show_sync_msg(u"❌ 連線失敗：{}".format(err), self.COLOR_ERROR)
             return
+
+        # 防呆：避免把「總表」整批匯出蓋掉「某圖紙類別的分表」
+        target_role = result.get("role") if (result and result.get("ok")) else u""
+        if target_role == u"sub":
+            target_cat = result.get("category") or tab
+            main_tab = result.get("mainTab") or u""
+            forms.alert(
+                u"目標頁籤「{}」是圖紙類別「{}」的【分表】，\n"
+                u"不能把總表整批匯出到這裡（會蓋掉分表內容）。\n\n"
+                u"請把「目標頁籤名稱」改成總表頁籤{}，再匯出。\n"
+                u"分表會在匯出後由「依圖紙類別拆分」自動更新。".format(
+                    tab, target_cat,
+                    u"（目前偵測到：{}）".format(main_tab) if main_tab else u""))
+            return
+
         sheet_recs = (result.get("records") if (result and result.get("ok")) else []) or []
 
         added, modified, removed = self._compute_export_diff(revit_recs, sheet_recs)
@@ -1684,10 +1743,17 @@ class BatchManageSheetsWindow(Window):
             forms.alert(u"Google Sheet 讀不到任何資料列，為避免誤刪已中止。\n"
                         u"請確認頁籤名稱正確、表格有資料。")
             return
-        dup_msg = self._check_dup_numbers(records)
-        if dup_msg:
-            forms.alert(dup_msg)
-            return
+        resolved_dup = False
+        if self._check_dup_numbers(records):
+            # 跳出對話框，讓使用者就地把重複圖號改掉（直接改 records）
+            dlg = _DupResolveWindow(records)
+            dlg.ShowDialog()
+            if not dlg.confirmed:
+                return  # 取消匯入
+            if self._check_dup_numbers(records):
+                forms.alert(u"仍有重複圖號，已中止匯入。請再試一次。")
+                return
+            resolved_dup = True
         role = result.get("role") or u"main"
         category = result.get("category") or u""
         batch = result.get("batchParams") or {}
@@ -1705,6 +1771,7 @@ class BatchManageSheetsWindow(Window):
         plan["tab"] = tab
         plan["role"] = role
         plan["mainTab"] = main_tab
+        plan["resolvedDup"] = resolved_dup
 
         n_changes = (len(plan["new"]) + len(plan["edit"]) + len(plan["toReal"])
                      + len(plan["toPlace"]) + len(plan["delete"]))
@@ -1740,13 +1807,13 @@ class BatchManageSheetsWindow(Window):
         """把套用計畫轉成預覽表格列（與實際套用同一份計畫，不會有落差）。"""
         rows = []
         for d in plan["new"]:
-            tag = u"🆕 新增" + (u"(真實)" if d["real"] else u"(預留)")
+            tag = u"🆕 新增" + (u"(真實圖紙)" if d["real"] else u"(僅文字資訊)")
             extra = u"; ".join([u"{}={}".format(k, v)
                                 for k, v in d.get("extra", {}).items() if v])
             rows.append([tag, d["num"], d["name"], extra])
         for d in plan["toReal"]:
             s = d["sheet"]
-            rows.append([u"⬆️ 轉真實", d["num"] or s.SheetNumber,
+            rows.append([u"⬆️ 轉真實圖紙", d["num"] or s.SheetNumber,
                          d["name"] or s.Name, self._edit_detail(d)])
         for d in plan["edit"]:
             s = d["sheet"]
@@ -1754,7 +1821,8 @@ class BatchManageSheetsWindow(Window):
                          d["name"] or s.Name, self._edit_detail(d)])
         for d in plan["toPlace"]:
             s = d["sheet"]
-            rows.append([u"⚠️ 真實→預留", s.SheetNumber, s.Name, u"刪原圖建預留"])
+            rows.append([u"⚠️ 真實圖紙→僅文字資訊", s.SheetNumber, s.Name,
+                         u"刪原圖改建為僅文字資訊"])
         for d in plan["delete"]:
             s = d["sheet"]
             rows.append([u"🗑️ 刪除", s.SheetNumber, s.Name, u"Sheet 已移除"])
@@ -1768,7 +1836,7 @@ class BatchManageSheetsWindow(Window):
         summary = self._make_cell(
             (scope_note + u"\n" if scope_note else u"") +
             u"差異預覽（唯讀，按下方「確認執行」才會套用）\n"
-            u"新增 {}／修改 {}／轉真實 {}／降預留刪除 {}／刪除 {}".format(
+            u"新增 {}／修改 {}／轉真實圖紙 {}／降為僅文字資訊 {}／刪除 {}".format(
                 len(plan["new"]), len(plan["edit"]), len(plan["toReal"]),
                 len(plan["toPlace"]), len(plan["delete"])),
             bold=True)
@@ -1799,7 +1867,7 @@ class BatchManageSheetsWindow(Window):
     # ---- 同步分頁：⑤ 套用匯入（會修改 Revit）----
 
     def _set_param(self, sheet, pname, value):
-        p = sheet.LookupParameter(pname)
+        p = _lookup_sheet_param(sheet, pname)
         if p is None or p.IsReadOnly:
             return
         try:
@@ -1906,16 +1974,23 @@ class BatchManageSheetsWindow(Window):
         if not plan:
             forms.alert(u"請先按「匯入（預覽差異）」載入要套用的內容。")
             return
-        # 刪除前清單確認（你的要求）
-        del_lines = [u"  {}  {}".format(d["sheet"].SheetNumber, d["sheet"].Name)
-                     for d in plan["toPlace"]]
-        del_lines += [u"  {}  {}".format(d["sheet"].SheetNumber, d["sheet"].Name)
-                      for d in plan["delete"]]
-        if del_lines:
-            msg = u"以下圖紙將被刪除，確定執行嗎？\n\n" + u"\n".join(del_lines[:30])
-            if len(del_lines) > 30:
-                msg += u"\n  …還有 {} 張".format(len(del_lines) - 30)
-            if not forms.alert(msg, yes=True, no=True):
+        # 刪除/重建前：用可捲動視窗列出「全部」將被刪除或重建的圖紙
+        del_rows = []
+        for d in plan["toPlace"]:
+            s = d["sheet"]
+            del_rows.append([u"轉為僅文字資訊（原圖刪除重建）",
+                             s.SheetNumber or u"", s.Name or u""])
+        for d in plan["delete"]:
+            s = d["sheet"]
+            del_rows.append([u"刪除", s.SheetNumber or u"", s.Name or u""])
+        if del_rows:
+            dlg = _ListConfirmWindow(
+                u"確認刪除 / 重建圖紙",
+                u"以下 {} 張圖紙將被刪除或重建，確定執行嗎？".format(len(del_rows)),
+                [u"動作", u"圖號", u"圖名"], del_rows,
+                confirm_label=u"確定執行")
+            dlg.ShowDialog()
+            if not dlg.confirmed:
                 return
         # 不在 modal 視窗內改模型(會被還原)；關窗後由 main() 執行交易
         self.result = {"mode": "import_apply", "plan": plan}
@@ -1927,11 +2002,90 @@ class BatchManageSheetsWindow(Window):
                     u"未來按下後，會把『修正備註』欄裡的工作，\n"
                     u"分配給對應的『繪圖員』同事。\n（分配方式待討論）")
 
+    def _existing_sheet_param_names(self, wanted):
+        """回傳 wanted 之中『圖紙已具備』的參數名稱集合。
+
+        用實際圖紙的 LookupParameter 判斷 → 內建/專案/共用參數都算數。
+        （內建參數如 繪圖員/審圖員/設計者/批准者/圖紙發布日期 不會出現在
+          doc.ParameterBindings，所以不能只看綁定。）
+        空專案無圖紙時，退而用 ParameterBindings（只看得到專案/共用參數）。
+        """
+        found = set()
+        sheets = list(
+            DB.FilteredElementCollector(doc).OfClass(DB.ViewSheet).ToElements())
+        if sheets:
+            # 優先用真實圖紙；沒有就用第一張（預留圖紙也有識別資料參數）
+            sample = next((s for s in sheets if not s.IsPlaceholder), sheets[0])
+            for name in wanted:
+                try:
+                    if _lookup_sheet_param(sample, name) is not None:
+                        found.add(name)
+                except Exception:
+                    pass
+            return found
+
+        # 後備（空專案）：用 ParameterBindings 找已綁到圖紙類別的專案/共用參數
+        try:
+            sheets_cat = DB.Category.GetCategory(doc, DB.BuiltInCategory.OST_Sheets)
+        except Exception:
+            sheets_cat = None
+        try:
+            it = doc.ParameterBindings.ForwardIterator()
+            it.Reset()
+            while it.MoveNext():
+                definition = it.Key
+                binding = it.Current
+                try:
+                    cats = binding.Categories
+                except Exception:
+                    cats = None
+                if cats is None:
+                    continue
+                for c in cats:
+                    if sheets_cat is not None and \
+                            c.Id.IntegerValue == sheets_cat.Id.IntegerValue:
+                        if definition.Name in wanted:
+                            found.add(definition.Name)
+                        break
+        except Exception:
+            pass
+        return found
+
     def _on_build_env(self, sender, args):
-        forms.alert(u"「建立環境」功能開發中（佔位）。\n\n"
-                    u"規劃：一鍵自動在 Revit 建立同步所需的圖紙文字參數\n"
-                    u"（圖紙類別/繪圖員/修正備註/審圖員/設計者/批准者/圖紙發布日期/校核2），\n"
-                    u"已存在的略過，並提示 Google 端設定。")
+        needed = list(self.SYNC_TEXT_PARAMS) + list(self.BATCH_PARAMS)
+        existing = self._existing_sheet_param_names(needed)
+        missing = [n for n in needed if n not in existing]
+        have = [n for n in needed if n in existing]
+
+        if not missing:
+            # 參數都在了，仍可能要補建「圖紙明細表」→ 走 build_env(只建明細表)
+            if not forms.alert(
+                    u"同步所需的 {} 個圖紙文字參數都已存在。\n\n{}\n\n"
+                    u"要（重新）確認並建立「BaF_Sheet專用圖紙明細表」嗎？".format(
+                        len(needed), u"、".join(needed)),
+                    yes=True, no=True):
+                return
+            self.result = {"mode": "build_env", "missing": [],
+                           "have": have, "all_params": needed}
+            self.confirmed = True
+            self.Close()
+            return
+
+        msg = u"將在「圖紙(Sheets)」類別建立下列文字參數：\n\n"
+        msg += u"\n".join(u"  ＋ " + n for n in missing)
+        if have:
+            msg += u"\n\n已存在，將略過：\n" + u"\n".join(u"  ✓ " + n for n in have)
+        msg += (u"\n\n說明：公司共用參數檔已有的會直接沿用共用參數；其餘建為專案參數，"
+                u"並建立「BaF_Sheet專用圖紙明細表」。不會更動 Google Sheet。\n\n"
+                u"確定建立嗎？")
+        if not forms.alert(msg, yes=True, no=True):
+            return
+
+        # 不在 modal 視窗內改文件（與匯入一致）；關窗後由 main() 在交易內建立
+        self.result = {"mode": "build_env", "missing": missing,
+                       "have": have, "all_params": needed}
+        self.confirmed = True
+        self.Close()
 
     def _on_edit_by_minutes(self, sender, args):
         forms.alert(u"「依會議紀錄編輯圖紙清單」功能開發中（佔位）。\n\n"
@@ -1982,7 +2136,7 @@ class BatchManageSheetsWindow(Window):
                         targets.append((d["sheet"], d, False))
                         done["toReal"] += 1
                     except Exception as ex:
-                        fails.append((d.get("num"), u"轉真實:" + unicode(ex)))
+                        fails.append((d.get("num"), u"轉真實圖紙:" + unicode(ex)))
 
                 for d in plan["edit"]:
                     targets.append((d["sheet"], d, False))
@@ -2006,7 +2160,7 @@ class BatchManageSheetsWindow(Window):
                         targets.append((ns, d, True))
                         done["toPlace"] += 1
                     except Exception as ex:
-                        fails.append((d.get("num"), u"降預留:" + unicode(ex)))
+                        fails.append((d.get("num"), u"降為僅文字資訊:" + unicode(ex)))
 
                 # 只處理「有指定圖號」的；沒給圖號就保留 Revit 預設(不再指派未命名)
                 renum = [t for t in targets if t[1]["num"]]
@@ -2051,8 +2205,8 @@ class BatchManageSheetsWindow(Window):
         except Exception as ex:
             return u"❌ 套用失敗，已自動復原：{}".format(ex), True, done
 
-        report = (u"🆕 新增 {} ／ ✏️ 修改 {} ／ ⬆️ 轉真實 {} ／ "
-                  u"⚠️ 降預留 {} ／ 🗑️ 刪除 {}".format(
+        report = (u"🆕 新增 {} ／ ✏️ 修改 {} ／ ⬆️ 轉真實圖紙 {} ／ "
+                  u"⚠️ 降為僅文字資訊 {} ／ 🗑️ 刪除 {}".format(
                       done["new"], done["edit"], done["toReal"],
                       done["toPlace"], done["delete"]))
         if fails:
@@ -2164,6 +2318,277 @@ class BatchManageSheetsWindow(Window):
 
 
 # ---------------------------------------------------------------------------
+# 輔助對話框：可捲動清單確認 / 重複圖號就地修改
+# ---------------------------------------------------------------------------
+
+def _brush(rgb):
+    return SolidColorBrush(Color.FromRgb(rgb[0], rgb[1], rgb[2]))
+
+
+class _ListConfirmWindow(Window):
+    """可捲動的清單確認視窗：列出『全部』項目（右側有捲軸），按確定/取消。"""
+
+    def __init__(self, title, intro, headers, rows,
+                 confirm_label=u"確定執行", cancel_label=u"取消"):
+        self.confirmed = False
+        self.Title = title
+        self.Width = 640
+        self.Height = 560
+        self.WindowStartupLocation = WindowStartupLocation.CenterScreen
+        self.Background = _brush((245, 245, 250))
+
+        root = Grid()
+        root.Margin = Thickness(16, 14, 16, 14)
+        root.RowDefinitions.Add(RowDefinition(Height=GridLength(1, GridUnitType.Auto)))
+        root.RowDefinitions.Add(RowDefinition(Height=GridLength(1, GridUnitType.Star)))
+        root.RowDefinitions.Add(RowDefinition(Height=GridLength(1, GridUnitType.Auto)))
+
+        head = TextBlock()
+        head.Text = intro
+        head.TextWrapping = TextWrapping.Wrap
+        head.FontSize = 13
+        head.FontWeight = FontWeights.Bold
+        head.Margin = Thickness(0, 0, 0, 10)
+        head.Foreground = _brush((180, 60, 60))
+        Grid.SetRow(head, 0)
+        root.Children.Add(head)
+
+        sv = ScrollViewer()
+        sv.VerticalScrollBarVisibility = ScrollBarVisibility.Visible
+        sv.HorizontalScrollBarVisibility = ScrollBarVisibility.Auto
+        sv.Background = _brush((255, 255, 255))
+        sv.BorderBrush = _brush((200, 205, 215))
+        sv.BorderThickness = Thickness(1)
+        sv.Padding = Thickness(8, 8, 8, 8)
+        sv.Content = self._build_table(headers, rows)
+        Grid.SetRow(sv, 1)
+        root.Children.Add(sv)
+
+        btns = StackPanel()
+        btns.Orientation = Orientation.Horizontal
+        btns.HorizontalAlignment = HorizontalAlignment.Right
+        btns.Margin = Thickness(0, 12, 0, 0)
+
+        ok = Button()
+        ok.Content = u"{}（共 {} 項）".format(confirm_label, len(rows))
+        ok.Padding = Thickness(14, 6, 14, 6)
+        ok.Margin = Thickness(0, 0, 8, 0)
+        ok.Background = _brush((220, 53, 69))
+        ok.Foreground = _brush((255, 255, 255))
+        ok.FontWeight = FontWeights.Bold
+        ok.Click += self._on_ok
+        btns.Children.Add(ok)
+
+        cancel = Button()
+        cancel.Content = cancel_label
+        cancel.Padding = Thickness(14, 6, 14, 6)
+        cancel.Click += self._on_cancel
+        btns.Children.Add(cancel)
+
+        Grid.SetRow(btns, 2)
+        root.Children.Add(btns)
+        self.Content = root
+
+    def _build_table(self, headers, rows):
+        grid = Grid()
+        for _ in headers:
+            grid.ColumnDefinitions.Add(
+                ColumnDefinition(Width=GridLength(1, GridUnitType.Auto)))
+        for _ in range(len(rows) + 1):
+            grid.RowDefinitions.Add(
+                RowDefinition(Height=GridLength(1, GridUnitType.Auto)))
+        for c, h in enumerate(headers):
+            tb = TextBlock()
+            tb.Text = h
+            tb.FontWeight = FontWeights.Bold
+            tb.Margin = Thickness(6, 2, 14, 6)
+            Grid.SetRow(tb, 0)
+            Grid.SetColumn(tb, c)
+            grid.Children.Add(tb)
+        for r, rowdata in enumerate(rows):
+            for c, val in enumerate(rowdata):
+                tb = TextBlock()
+                tb.Text = val if val is not None else u""
+                tb.Margin = Thickness(6, 2, 14, 2)
+                Grid.SetRow(tb, r + 1)
+                Grid.SetColumn(tb, c)
+                grid.Children.Add(tb)
+        return grid
+
+    def _on_ok(self, sender, args):
+        self.confirmed = True
+        self.Close()
+
+    def _on_cancel(self, sender, args):
+        self.confirmed = False
+        self.Close()
+
+
+class _DupResolveWindow(Window):
+    """重複圖號就地修改：列出每組重複圖號，使用者改到不重複後按「確定」。
+
+    確定後直接更新傳入的 records（rec[u'圖紙號碼']）。
+    """
+
+    def __init__(self, records):
+        self.confirmed = False
+        self.records = records
+        self._edit_boxes = []  # (textbox, rec)
+
+        num_to_recs = {}
+        order = []
+        for rec in records:
+            num = unicode(rec.get(u"圖紙號碼") or u"").strip()
+            if not num:
+                continue
+            if num not in num_to_recs:
+                num_to_recs[num] = []
+                order.append(num)
+            num_to_recs[num].append(rec)
+        groups = [(num, num_to_recs[num]) for num in order
+                  if len(num_to_recs[num]) > 1]
+        self._build_ui(groups)
+
+    def _build_ui(self, groups):
+        self.Title = u"解決重複圖號"
+        self.Width = 680
+        self.Height = 600
+        self.WindowStartupLocation = WindowStartupLocation.CenterScreen
+        self.Background = _brush((245, 245, 250))
+
+        root = Grid()
+        root.Margin = Thickness(16, 14, 16, 14)
+        root.RowDefinitions.Add(RowDefinition(Height=GridLength(1, GridUnitType.Auto)))
+        root.RowDefinitions.Add(RowDefinition(Height=GridLength(1, GridUnitType.Star)))
+        root.RowDefinitions.Add(RowDefinition(Height=GridLength(1, GridUnitType.Auto)))
+        root.RowDefinitions.Add(RowDefinition(Height=GridLength(1, GridUnitType.Auto)))
+
+        intro = TextBlock()
+        intro.Text = (u"Google Sheet 有重複的圖號，無法匯入。\n"
+                      u"請把每組重複的圖號改成不重複（直接修改下方圖號欄），再按「確定」。")
+        intro.TextWrapping = TextWrapping.Wrap
+        intro.FontSize = 13
+        intro.FontWeight = FontWeights.Bold
+        intro.Foreground = _brush((180, 90, 0))
+        intro.Margin = Thickness(0, 0, 0, 10)
+        Grid.SetRow(intro, 0)
+        root.Children.Add(intro)
+
+        sv = ScrollViewer()
+        sv.VerticalScrollBarVisibility = ScrollBarVisibility.Visible
+        sv.Background = _brush((255, 255, 255))
+        sv.BorderBrush = _brush((200, 205, 215))
+        sv.BorderThickness = Thickness(1)
+        sv.Padding = Thickness(8, 8, 8, 8)
+        panel = StackPanel()
+        panel.Orientation = Orientation.Vertical
+        for num, recs in groups:
+            gh = TextBlock()
+            gh.Text = u"重複圖號：{}（{} 張）".format(num, len(recs))
+            gh.FontWeight = FontWeights.Bold
+            gh.Margin = Thickness(2, 8, 2, 4)
+            gh.Foreground = _brush((30, 30, 40))
+            panel.Children.Add(gh)
+            for rec in recs:
+                panel.Children.Add(self._make_row(rec))
+        sv.Content = panel
+        Grid.SetRow(sv, 1)
+        root.Children.Add(sv)
+
+        self.err_text = TextBlock()
+        self.err_text.Foreground = _brush((220, 53, 69))
+        self.err_text.TextWrapping = TextWrapping.Wrap
+        self.err_text.Margin = Thickness(2, 8, 2, 0)
+        Grid.SetRow(self.err_text, 2)
+        root.Children.Add(self.err_text)
+
+        btns = StackPanel()
+        btns.Orientation = Orientation.Horizontal
+        btns.HorizontalAlignment = HorizontalAlignment.Right
+        btns.Margin = Thickness(0, 10, 0, 0)
+        ok = Button()
+        ok.Content = u"確定"
+        ok.Padding = Thickness(16, 6, 16, 6)
+        ok.Margin = Thickness(0, 0, 8, 0)
+        ok.Background = _brush((99, 102, 241))
+        ok.Foreground = _brush((255, 255, 255))
+        ok.FontWeight = FontWeights.Bold
+        ok.Click += self._on_ok
+        btns.Children.Add(ok)
+        cancel = Button()
+        cancel.Content = u"取消匯入"
+        cancel.Padding = Thickness(16, 6, 16, 6)
+        cancel.Click += self._on_cancel
+        btns.Children.Add(cancel)
+        Grid.SetRow(btns, 3)
+        root.Children.Add(btns)
+        self.Content = root
+
+    def _make_row(self, rec):
+        row = Grid()
+        row.Margin = Thickness(0, 1, 0, 1)
+        row.ColumnDefinitions.Add(ColumnDefinition(Width=GridLength(150)))
+        row.ColumnDefinitions.Add(ColumnDefinition(Width=GridLength(1, GridUnitType.Star)))
+        row.ColumnDefinitions.Add(ColumnDefinition(Width=GridLength(90)))
+
+        tb = TextBox()
+        tb.Text = unicode(rec.get(u"圖紙號碼") or u"")
+        tb.Padding = Thickness(4, 3, 4, 3)
+        tb.Margin = Thickness(0, 0, 6, 0)
+        Grid.SetColumn(tb, 0)
+        row.Children.Add(tb)
+        self._edit_boxes.append((tb, rec))
+
+        nm = TextBlock()
+        nm.Text = unicode(rec.get(u"圖紙名稱") or u"")
+        nm.VerticalAlignment = VerticalAlignment.Center
+        nm.TextTrimming = TextTrimming.CharacterEllipsis
+        nm.Foreground = _brush((90, 95, 110))
+        Grid.SetColumn(nm, 1)
+        row.Children.Add(nm)
+
+        ut = TextBlock()
+        ut.Text = unicode(rec.get(u"UID") or u"")[:8]
+        ut.VerticalAlignment = VerticalAlignment.Center
+        ut.Foreground = _brush((150, 155, 165))
+        ut.FontSize = 11
+        Grid.SetColumn(ut, 2)
+        row.Children.Add(ut)
+        return row
+
+    def _on_ok(self, sender, args):
+        proposed = {}
+        for tb, rec in self._edit_boxes:
+            new_num = (tb.Text or u"").strip()
+            if not new_num:
+                self.err_text.Text = u"圖號不可空白，請填寫。"
+                return
+            proposed[id(rec)] = new_num
+        # 全部圖號（編輯過用新值、其餘用原值）做唯一性檢查
+        counts = {}
+        for rec in self.records:
+            if id(rec) in proposed:
+                num = proposed[id(rec)]
+            else:
+                num = unicode(rec.get(u"圖紙號碼") or u"").strip()
+            if not num:
+                continue
+            counts[num] = counts.get(num, 0) + 1
+        still_dup = sorted([n for n, c in counts.items() if c > 1])
+        if still_dup:
+            self.err_text.Text = u"仍有重複：{}　請再修改。".format(u"、".join(still_dup))
+            return
+        for tb, rec in self._edit_boxes:
+            rec[u"圖紙號碼"] = proposed[id(rec)]
+        self.confirmed = True
+        self.Close()
+
+    def _on_cancel(self, sender, args):
+        self.confirmed = False
+        self.Close()
+
+
+# ---------------------------------------------------------------------------
 # 執行（Revit）
 # ---------------------------------------------------------------------------
 
@@ -2240,6 +2665,301 @@ def edit_sheets(result, document):
 
 
 # ---------------------------------------------------------------------------
+# 建立同步環境（在 Sheets 類別建立文字參數 + 圖紙明細表）
+# ---------------------------------------------------------------------------
+
+# 公司共用參數檔所在資料夾（請勿改動該資料夾內容）
+COMPANY_SP_DIR = (u"\\\\data.bioarch.com.tw\\Public\\工作區"
+                  u"\\03 技術中心專區\\06-2 REVIT\\03 Revit 資料庫\\03 共用參數")
+
+
+def _text_spec():
+    """文字資料型別：Revit 2022+ 用 SpecTypeId.String.Text，舊版用 ParameterType.Text。"""
+    try:
+        return DB.SpecTypeId.String.Text
+    except Exception:
+        return DB.ParameterType.Text
+
+
+# Revit 共用參數檔表頭（空檔，Revit 之後會自行改寫）
+_SP_HEADER = (
+    u"# This is a Revit shared parameter file.\n"
+    u"# Do not edit manually.\n"
+    u"*META\tVERSION\tMINVERSION\n"
+    u"META\t2\t1\n"
+    u"*GROUP\tID\tNAME\n"
+    u"*PARAM\tGUID\tNAME\tDATATYPE\tDATACATEGORY\tGROUP\tVISIBLE"
+    u"\tDESCRIPTION\tUSERMODIFIABLE\tHIDEWHENNOVALUE\n")
+
+
+def _find_company_sp_file():
+    """回傳公司共用參數檔(.txt)的完整路徑；資料夾不可達/無 txt 時回 None。"""
+    try:
+        names = os.listdir(COMPANY_SP_DIR)
+    except Exception:
+        return None
+    txts = []
+    for n in names:
+        if n.lower().endswith(u".txt"):
+            full = os.path.join(COMPANY_SP_DIR, n)
+            try:
+                if os.path.isfile(full):
+                    txts.append(full)
+            except Exception:
+                pass
+    if not txts:
+        return None
+    try:
+        txts.sort(key=lambda f: os.path.getmtime(f), reverse=True)
+    except Exception:
+        pass
+    return txts[0]
+
+
+def build_env(result, document):
+    """在「圖紙(Sheets)」類別建立缺少的文字參數，並建立「圖紙明細表」。
+
+    優先沿用公司共用參數（若該名稱已在公司共用參數檔中，保留其 GUID）；
+    公司檔沒有的，才用本機暫存共用參數檔建為專案參數。
+    不會對 Google Sheet 做任何動作。
+
+    回傳 (created_shared, created_project, failed, sched_msg)。
+    """
+    import tempfile
+
+    missing = list(result.get("missing") or [])
+    all_params = result.get("all_params") or missing
+    created_shared = []
+    created_project = []
+    failed = []
+    sched_msg = u""
+    if not missing:
+        # 仍嘗試建立明細表（參數都已存在的情況）
+        try:
+            sched_msg = _ensure_sheet_schedule(document, all_params)
+        except Exception as ex:
+            sched_msg = u"⚠ 建立圖紙明細表失敗：{}".format(ex)
+        return created_shared, created_project, failed, sched_msg
+
+    app = document.Application
+    spec = _text_spec()
+    sheets_cat = DB.Category.GetCategory(document, DB.BuiltInCategory.OST_Sheets)
+
+    def _bind(ext_def):
+        cs = app.Create.NewCategorySet()
+        cs.Insert(sheets_cat)
+        binding = app.Create.NewInstanceBinding(cs)
+        try:
+            return document.ParameterBindings.Insert(
+                ext_def, binding, DB.BuiltInParameterGroup.PG_TEXT)
+        except Exception:
+            # 新版本可能移除 BuiltInParameterGroup 多載 → 用兩參數版
+            return document.ParameterBindings.Insert(ext_def, binding)
+
+    old_sp = None
+    try:
+        old_sp = app.SharedParametersFilename
+    except Exception:
+        old_sp = None
+
+    company_file = _find_company_sp_file()
+
+    try:
+        with revit.Transaction(u"BaF 建立同步參數"):
+            remaining = list(missing)
+
+            # (1) 公司共用參數檔已有的 → 直接沿用共用參數定義（保留 GUID）
+            if company_file:
+                cdef = None
+                try:
+                    app.SharedParametersFilename = company_file
+                    cdef = app.OpenSharedParameterFile()
+                except Exception:
+                    cdef = None
+                if cdef is not None:
+                    found = {}
+                    for g in cdef.Groups:
+                        for d in g.Definitions:
+                            if d.Name in remaining and d.Name not in found:
+                                found[d.Name] = d
+                    for name in list(remaining):
+                        ext_def = found.get(name)
+                        if ext_def is None:
+                            continue
+                        try:
+                            if _bind(ext_def):
+                                created_shared.append(name)
+                            else:
+                                failed.append((name, u"共用參數綁定未成功"))
+                        except Exception as ex:
+                            failed.append((name, u"共用:" + unicode(ex)))
+                        remaining.remove(name)
+
+            # (2) 公司檔沒有的 → 用本機暫存共用參數檔建為專案參數
+            if remaining:
+                sp_path = os.path.join(tempfile.gettempdir(),
+                                       u"BaF_shared_params.txt")
+                tdef = None
+                try:
+                    with open(sp_path, "w") as f:
+                        f.write(_SP_HEADER.encode("utf-8"))
+                    app.SharedParametersFilename = sp_path
+                    tdef = app.OpenSharedParameterFile()
+                except Exception as ex:
+                    for name in remaining:
+                        failed.append((name, u"建暫存共用參數檔失敗:" + unicode(ex)))
+                    remaining = []
+                if remaining and tdef is None:
+                    for name in remaining:
+                        failed.append((name, u"無法開啟暫存共用參數檔"))
+                elif remaining:
+                    group = None
+                    for g in tdef.Groups:
+                        if g.Name == u"BaF":
+                            group = g
+                            break
+                    if group is None:
+                        group = tdef.Groups.Create(u"BaF")
+                    for name in remaining:
+                        try:
+                            ext_def = None
+                            for d in group.Definitions:
+                                if d.Name == name:
+                                    ext_def = d
+                                    break
+                            if ext_def is None:
+                                opts = DB.ExternalDefinitionCreationOptions(name, spec)
+                                ext_def = group.Definitions.Create(opts)
+                            if _bind(ext_def):
+                                created_project.append(name)
+                            else:
+                                failed.append((name, u"專案參數綁定未成功"))
+                        except Exception as ex:
+                            failed.append((name, unicode(ex)))
+    finally:
+        # 還原使用者原本的共用參數檔設定
+        try:
+            if old_sp:
+                app.SharedParametersFilename = old_sp
+        except Exception:
+            pass
+
+    # (3) 建立「圖紙明細表」（參數已綁定並提交後才建，欄位才抓得到）
+    try:
+        sched_msg = _ensure_sheet_schedule(document, all_params)
+    except Exception as ex:
+        sched_msg = u"⚠ 建立圖紙明細表失敗：{}".format(ex)
+
+    return created_shared, created_project, failed, sched_msg
+
+
+def _ensure_sheet_schedule(document, want_params):
+    """建立「圖紙明細表」(若同名的已存在則不重複建立)。回傳說明文字。"""
+    sched_name = u"BaF_Sheet專用圖紙明細表"
+    for v in DB.FilteredElementCollector(document).OfClass(DB.ViewSchedule).ToElements():
+        try:
+            if v.Name == sched_name:
+                return u"「{}」已存在，未重複建立。".format(sched_name)
+        except Exception:
+            pass
+
+    added = []
+    with revit.Transaction(u"BaF 建立圖紙明細表"):
+        # 圖紙清單必須用 CreateSheetList()；用 CreateSchedule(OST_Sheets) 會丟例外
+        try:
+            sched = DB.ViewSchedule.CreateSheetList(document)
+        except Exception:
+            sheets_cat_id = DB.Category.GetCategory(
+                document, DB.BuiltInCategory.OST_Sheets).Id
+            sched = DB.ViewSchedule.CreateSchedule(document, sheets_cat_id)
+        try:
+            sched.Name = sched_name
+        except Exception:
+            pass
+        definition = sched.Definition
+
+        # CreateSheetList 可能已預設帶圖號/圖名欄位 → 記下避免重複加
+        existing_pids = set()
+        try:
+            for i in range(definition.GetFieldCount()):
+                try:
+                    existing_pids.add(definition.GetField(i).ParameterId.IntegerValue)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        sf_by_name = {}
+        sf_by_pid = {}
+        for sf in definition.GetSchedulableFields():
+            try:
+                nm = sf.GetName(document)
+            except Exception:
+                nm = None
+            if nm and nm not in sf_by_name:
+                sf_by_name[nm] = sf
+            try:
+                pid = sf.ParameterId.IntegerValue
+                if pid not in sf_by_pid:
+                    sf_by_pid[pid] = sf
+            except Exception:
+                pass
+
+        def _field_for(name):
+            sf = sf_by_name.get(name)
+            if sf is not None:
+                return sf
+            # 內建參數(如 圖紙發布日期)用 ParameterId 對應，避免比錯中文用字
+            bip = BUILTIN_PARAM_MAP.get(name)
+            if bip is not None:
+                try:
+                    pid = DB.ElementId(bip).IntegerValue
+                    return sf_by_pid.get(pid)
+                except Exception:
+                    return None
+            return None
+
+        # 先放圖號/圖名(內建欄位名稱依語言而異，逐一嘗試)，再放 8 個同步參數
+        ordered = []  # (顯示名稱, SchedulableField)
+        for cand in [u"圖紙編號", u"圖紙號碼", u"Sheet Number"]:
+            if cand in sf_by_name:
+                ordered.append((cand, sf_by_name[cand]))
+                break
+        for cand in [u"圖紙名稱", u"Sheet Name"]:
+            if cand in sf_by_name:
+                ordered.append((cand, sf_by_name[cand]))
+                break
+        seen_names = set(nm for nm, _ in ordered)
+        for nm in want_params:
+            if nm in seen_names:
+                continue
+            sf = _field_for(nm)
+            if sf is not None:
+                ordered.append((nm, sf))
+                seen_names.add(nm)
+
+        for nm, sf in ordered:
+            try:
+                pid = sf.ParameterId.IntegerValue
+            except Exception:
+                pid = None
+            if pid is not None and pid in existing_pids:
+                added.append(nm)  # 已是預設欄位，不重複加
+                continue
+            try:
+                definition.AddField(sf)
+                added.append(nm)
+                if pid is not None:
+                    existing_pids.add(pid)
+            except Exception:
+                pass
+
+    if added:
+        return u"已建立「{}」，欄位：{}".format(sched_name, u"、".join(added))
+    return u"已建立「{}」（但未加入欄位，請手動設定）".format(sched_name)
+
+
+# ---------------------------------------------------------------------------
 # 主流程
 # ---------------------------------------------------------------------------
 
@@ -2296,6 +3016,37 @@ def main():
             for old_num, reason in failed:
                 output.print_md("- `{}`: {}".format(old_num, reason))
 
+    elif win.result["mode"] == "build_env":
+        created_shared, created_project, failed, sched_msg = build_env(win.result, doc)
+        have = win.result.get("have") or []
+        output.print_md("# 🛠️ 建立同步環境")
+        output.print_md("- 沿用公司共用參數: **{}** 個".format(len(created_shared)))
+        output.print_md("- 新建專案參數: **{}** 個".format(len(created_project)))
+        output.print_md("- 已存在略過: **{}** 個".format(len(have)))
+        output.print_md("- 失敗: **{}** 個".format(len(failed)))
+        if created_shared:
+            output.print_md("\n## 沿用公司共用參數（保留 GUID）")
+            for name in created_shared:
+                output.print_md("- `{}`".format(name))
+        if created_project:
+            output.print_md("\n## 新建專案參數")
+            for name in created_project:
+                output.print_md("- `{}`".format(name))
+        if have:
+            output.print_md("\n## 已存在（略過）")
+            for name in have:
+                output.print_md("- `{}`".format(name))
+        if failed:
+            output.print_md("\n## 失敗")
+            for name, reason in failed:
+                output.print_md("- `{}`: {}".format(name, reason))
+        if sched_msg:
+            output.print_md("\n## 圖紙明細表")
+            output.print_md("- {}".format(sched_msg))
+        if not failed:
+            output.print_md("\n✅ 環境就緒，可在圖紙屬性填寫並與 Google Sheet 同步。"
+                            "（本步驟未更動 Google Sheet）")
+
     elif win.result["mode"] == "import_apply":
         plan = win.result["plan"]
         # 在 modal 視窗關閉「之後」才改模型，交易才不會被還原
@@ -2312,13 +3063,14 @@ def main():
                 output.print_md("\n⚠ 自動同步總表/分表時有狀況：{} {}".format(e1 or "", e2 or ""))
             else:
                 output.print_md("\n🔄 已自動回寫總表並重新拆分各分表（全部對齊）。")
-        elif not is_err and (done.get("new", 0) > 0 or done.get("toPlace", 0) > 0):
-            # 總表匯入：有新增/刪除重建 → UID 會變動，自動回寫
+        elif not is_err and (done.get("new", 0) > 0 or done.get("toPlace", 0) > 0
+                             or plan.get("resolvedDup")):
+            # 總表匯入：有新增/刪除重建(UID 變動) 或 解決過重複圖號 → 自動回寫
             res, err, n = win._do_export(plan["url"], main_tab)
             if err:
                 output.print_md("\n⚠ 自動回寫 Google Sheet 失敗：{}".format(err))
             elif res and res.get("ok"):
-                output.print_md("\n🔄 已自動回寫 Google Sheet（更新變動/新建的 UID）。")
+                output.print_md("\n🔄 已自動回寫 Google Sheet（更新變動/新建的 UID、已修正的重複圖號）。")
             else:
                 output.print_md("\n⚠ 自動回寫回應異常：{}".format(res))
 
