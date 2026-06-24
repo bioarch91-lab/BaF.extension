@@ -100,12 +100,15 @@ def load_gsheet_cfg():
 
 
 def save_gsheet_cfg(cfg):
+    """把 cfg 合併進現有設定（不覆蓋掉其他鍵，例如 script_master）。"""
     try:
+        merged = load_gsheet_cfg()
+        merged.update(cfg)
         d = os.path.dirname(GSHEET_CFG)
         if d and not os.path.exists(d):
             os.makedirs(d)
         with open(GSHEET_CFG, "w") as f:
-            json.dump(cfg, f)
+            json.dump(merged, f)
         return True
     except Exception:
         return False
@@ -1256,12 +1259,12 @@ class BatchManageSheetsWindow(Window):
         assign_btn.Click += self._on_assign_tasks
         wbtn_row.Children.Add(assign_btn)
 
-        minutes_btn = Button()
-        minutes_btn.Content = u"👁 依會議紀錄編輯圖紙清單"
-        minutes_btn.Padding = Thickness(12, 6, 12, 6)
-        minutes_btn.FontWeight = FontWeights.Bold
-        minutes_btn.Click += self._on_edit_by_minutes
-        wbtn_row.Children.Add(minutes_btn)
+        redpen_btn = Button()
+        redpen_btn.Content = u"🖍 依紅筆圖註解"
+        redpen_btn.Padding = Thickness(12, 6, 12, 6)
+        redpen_btn.FontWeight = FontWeights.Bold
+        redpen_btn.Click += self._on_edit_by_redpen
+        wbtn_row.Children.Add(redpen_btn)
 
         cfg_panel.Children.Add(wbtn_row)
 
@@ -2139,10 +2142,11 @@ class BatchManageSheetsWindow(Window):
         self.confirmed = True
         self.Close()
 
-    def _on_edit_by_minutes(self, sender, args):
-        forms.alert(u"「依會議紀錄編輯圖紙清單」功能開發中（佔位）。\n\n"
-                    u"規劃：貼上/讀取會議紀錄 → 用 AI 抓出每張圖的待辦 →\n"
-                    u"預覽 → 寫進對應圖紙的『修正備註』。\n（需接 Claude API）")
+    def _on_edit_by_redpen(self, sender, args):
+        forms.alert(u"「依紅筆圖註解」功能開發中（佔位）。\n\n"
+                    u"概念：建築師用紅筆改完圖 → 掃描 → 程式判讀圖框上的圖紙參數\n"
+                    u"辨認是哪一張圖（UID/圖號）→ 把該圖所有紅筆註記寫進『修正備註』。\n"
+                    u"（需接 OCR／AI 影像辨識）")
 
     def _docs_path(self, filename):
         """回傳擴充功能 docs 資料夾下的檔案完整路徑。"""
