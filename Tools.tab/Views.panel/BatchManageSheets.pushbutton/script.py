@@ -31,7 +31,7 @@ from System.Windows import (
 from System.Windows.Controls import (
     StackPanel, Button, ScrollViewer, Grid, RowDefinition, ColumnDefinition,
     TextBlock, Border, Orientation, ComboBox, TextBox, TabControl, TabItem,
-    CheckBox, ScrollBarVisibility
+    CheckBox, ScrollBarVisibility, PasswordBox
 )
 from System.Windows.Media import SolidColorBrush, Color, FontFamily
 
@@ -112,6 +112,266 @@ def save_gsheet_cfg(cfg):
         return True
     except Exception:
         return False
+
+
+# ---------------------------------------------------------------------------
+# AI 視覺判讀（「依紅筆圖註解」用）：Claude / Gemini / ChatGPT 三家可選
+#   金鑰與模型存在同一份 baf_gsheet_config.json（不進 git）的 ai_keys / ai_models。
+#   作法：把 PDF（base64）直接送給有視覺能力的模型，回傳合併好的修改描述 JSON。
+# ---------------------------------------------------------------------------
+
+# (內部代號, UI 顯示名稱)；順序＝下拉選單順序
+AI_PROVIDER_LABELS = [
+    (u"claude", u"Claude (Anthropic)"),
+    (u"gemini", u"Gemini (Google)"),
+    (u"openai", u"ChatGPT (OpenAI)"),
+]
+AI_DEFAULT_MODELS = {
+    u"claude": u"claude-opus-4-8",
+    u"gemini": u"gemini-2.5-pro",
+    u"openai": u"gpt-4o",
+}
+
+
+def _ai_provider_label(provider):
+    for pk, pl in AI_PROVIDER_LABELS:
+        if pk == provider:
+            return pl
+    return provider
+
+
+def _ai_model_for(provider, models):
+    return (models.get(provider) or AI_DEFAULT_MODELS.get(provider) or u"").strip()
+
+
+def _file_to_base64(path):
+    """讀檔轉 base64，回傳 (base64 字串, 位元組數)。用 .NET 讀避免二進位編碼問題。"""
+    from System import Convert
+    from System.IO import File
+    data = File.ReadAllBytes(path)
+    return Convert.ToBase64String(data), data.Length
+
+
+def _describe_web_exception(ex):
+    """把 API 失敗原因組成可讀字串：HTTP 狀態碼 + 回應 body（API 錯誤訊息）；
+    連線層級錯誤（逾時／DNS／TLS）則回連線狀態 + 例外訊息。"""
+    try:
+        resp = getattr(ex, "Response", None)
+        if resp is None:
+            inner = getattr(ex, "clsException", None)
+            resp = getattr(inner, "Response", None) if inner is not None else None
+        code_txt, body = u"", u""
+        if resp is not None:
+            try:
+                sc = getattr(resp, "StatusCode", None)
+                if sc is not None:
+                    code_txt = u"HTTP {} {}".format(
+                        int(sc), getattr(resp, "StatusDescription", u"") or u"").strip()
+            except Exception:
+                pass
+            try:
+                from System.IO import StreamReader
+                from System.Text import Encoding
+                reader = StreamReader(resp.GetResponseStream(), Encoding.UTF8)
+                body = (reader.ReadToEnd() or u"").strip()
+                reader.Close()
+            except Exception:
+                pass
+        parts = []
+        if code_txt:
+            parts.append(code_txt)
+        if body:
+            parts.append(body)
+        if not parts:
+            # 沒有 HTTP 回應 → 連線層級錯誤
+            status = getattr(ex, "Status", None)
+            if status is not None:
+                parts.append(u"連線狀態：{}".format(status))
+            parts.append(unicode(getattr(ex, "Message", None) or ex))
+        return u"　".join(p for p in parts if p)
+    except Exception:
+        return unicode(getattr(ex, "Message", None) or ex)
+
+
+def _http_post_raw(url, body_text, headers, timeout_ms=300000):
+    """POST 文字 body（application/json），回傳 (回應字串, 錯誤字串)。
+    用 HttpWebRequest 以便設定較長的逾時（AI 判讀大張 PDF 可能要數十秒）。"""
+    try:
+        from System.Net import (WebRequest, ServicePointManager,
+                                SecurityProtocolType)
+        from System.Text import Encoding
+        from System.IO import StreamReader
+        ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12
+        req = WebRequest.Create(url)
+        req.Method = "POST"
+        req.ContentType = "application/json"
+        req.Timeout = timeout_ms
+        req.ReadWriteTimeout = timeout_ms
+        for k, v in headers.items():
+            req.Headers.Add(k, v)
+        data = Encoding.UTF8.GetBytes(body_text)
+        req.ContentLength = data.Length
+        stream = req.GetRequestStream()
+        stream.Write(data, 0, data.Length)
+        stream.Close()
+        resp = req.GetResponse()
+        reader = StreamReader(resp.GetResponseStream(), Encoding.UTF8)
+        text = reader.ReadToEnd()
+        reader.Close()
+        return text, None
+    except Exception as ex:
+        return None, _describe_web_exception(ex)
+
+
+def _redpen_build_prompt():
+    """送給 AI 的指令：逐頁讀圖框、把紅筆標示轉成具體中文描述、同張圖合併、輸出 JSON。"""
+    return (
+        u"你是建築圖協作助理。這個 PDF 是建築工程圖（A1 或 A3），每一頁是一張圖，"
+        u"頁面上有圖框（標題欄），圖框內含該圖的圖號、階段、日期、繪圖員等資訊；"
+        u"圖面上可能有以紅筆（或其他顏色）標註的修改意見，常見形式為箭頭、方框、"
+        u"圈選、底線、雲線（revision cloud）並搭配手寫或文字說明。\n\n"
+        u"請逐頁處理，完成以下工作：\n"
+        u"1. 從圖框讀出該頁的『圖號』(sheet_number)，盡量也讀出階段(stage)、日期(date)、"
+        u"繪圖員(drawer)。圖號要與圖框上印的完全一致（含英數字與符號，不要自行加減空白）。\n"
+        u"2. 找出該頁所有紅筆／手寫的修改標示，把每一個標示轉成一句**具體、可執行的中文描述**"
+        u"（說明位置與要改什麼，例如：『將北側外牆窗戶尺寸由 W1200 改為 W1500』、"
+        u"『樓梯間欄杆需補上高度標註』）。不要只寫『有紅筆』這類空泛內容。\n"
+        u"3. 同一頁（同一張圖）若有多個修改標示，請合併成一段，用全形分號『；』分隔。\n"
+        u"4. 沒有任何修改標示的頁面，請略過、不要列入結果。\n\n"
+        u"只輸出 JSON，不要任何其他文字或 markdown 圍欄，格式如下：\n"
+        u'{"sheets":[{"sheet_number":"圖號","stage":"階段","date":"日期",'
+        u'"drawer":"繪圖員","notes":"合併後的修改描述"}]}\n')
+
+
+def _redpen_extract_json(text):
+    """從模型回覆中抽出最外層 JSON 物件（容忍 ```json 圍欄與前後雜訊）。"""
+    if not text:
+        return None
+    t = text.strip()
+    if t.startswith(u"```"):
+        nl = t.find(u"\n")
+        if nl != -1:
+            t = t[nl + 1:]
+        t = t.rstrip()
+        if t.endswith(u"```"):
+            t = t[:-3]
+    t = t.strip()
+    i = t.find(u"{")
+    j = t.rfind(u"}")
+    if i == -1 or j == -1 or j < i:
+        return None
+    try:
+        return json.loads(t[i:j + 1])
+    except Exception:
+        return None
+
+
+def _redpen_call_claude(model, key, b64, prompt):
+    body = json.dumps({
+        "model": model, "max_tokens": 8000,
+        "messages": [{"role": "user", "content": [
+            {"type": "document",
+             "source": {"type": "base64",
+                        "media_type": "application/pdf", "data": b64}},
+            {"type": "text", "text": prompt}]}]})
+    headers = {"x-api-key": key, "anthropic-version": "2023-06-01"}
+    resp, err = _http_post_raw(
+        "https://api.anthropic.com/v1/messages", body, headers)
+    if err:
+        return None, err
+    try:
+        d = json.loads(resp)
+    except Exception:
+        return None, u"回應非 JSON：{}".format(resp[:300])
+    if d.get("type") == "error":
+        e = d.get("error") or {}
+        return None, u"{}: {}".format(
+            e.get("type") or u"error", e.get("message") or unicode(d.get("error")))
+    parts = d.get("content") or []
+    txt = u"".join(p.get("text") or u""
+                   for p in parts if p.get("type") == "text")
+    if not txt:
+        return None, u"Anthropic 回應沒有文字內容（stop_reason={}）：{}".format(
+            d.get("stop_reason"), resp[:300])
+    return txt, None
+
+
+def _redpen_call_gemini(model, key, b64, prompt):
+    url = ("https://generativelanguage.googleapis.com/v1beta/models/"
+           + model + ":generateContent?key=" + key)
+    body = json.dumps({
+        "contents": [{"parts": [
+            {"inline_data": {"mime_type": "application/pdf", "data": b64}},
+            {"text": prompt}]}]})
+    resp, err = _http_post_raw(url, body, {})
+    if err:
+        return None, err
+    try:
+        d = json.loads(resp)
+    except Exception:
+        return None, u"回應非 JSON：{}".format(resp[:300])
+    if d.get("error"):
+        return None, unicode(d.get("error"))
+    cands = d.get("candidates") or []
+    if not cands:
+        return None, u"無 candidates：{}".format(resp[:300])
+    parts = (cands[0].get("content") or {}).get("parts") or []
+    txt = u"".join(p.get("text") or u"" for p in parts if p.get("text"))
+    return txt, None
+
+
+def _redpen_call_openai(model, key, b64, prompt):
+    body = json.dumps({
+        "model": model,
+        "input": [{"role": "user", "content": [
+            {"type": "input_file", "filename": "redpen.pdf",
+             "file_data": "data:application/pdf;base64," + b64},
+            {"type": "input_text", "text": prompt}]}]})
+    headers = {"Authorization": "Bearer " + key}
+    resp, err = _http_post_raw(
+        "https://api.openai.com/v1/responses", body, headers)
+    if err:
+        return None, err
+    try:
+        d = json.loads(resp)
+    except Exception:
+        return None, u"回應非 JSON：{}".format(resp[:300])
+    if d.get("error"):
+        return None, unicode(d.get("error"))
+    chunks = []
+    for item in (d.get("output") or []):
+        for c in (item.get("content") or []):
+            if c.get("type") == "output_text" and c.get("text"):
+                chunks.append(c.get("text"))
+    txt = u"".join(chunks)
+    if not txt and d.get("output_text"):
+        txt = d.get("output_text")
+    return txt, None
+
+
+def _redpen_call_ai(provider, model, key, b64, prompt):
+    """依後端代號分派。回傳 (模型文字回覆, 錯誤字串)。"""
+    if provider == u"claude":
+        return _redpen_call_claude(model, key, b64, prompt)
+    if provider == u"gemini":
+        return _redpen_call_gemini(model, key, b64, prompt)
+    if provider == u"openai":
+        return _redpen_call_openai(model, key, b64, prompt)
+    return None, u"未知的 AI 後端：{}".format(provider)
+
+
+def _doevents():
+    """讓 WPF 把待處理的版面/繪製事件跑一輪（顯示『處理中』訊息用）。"""
+    try:
+        from System.Windows.Threading import (DispatcherFrame, Dispatcher,
+                                              DispatcherPriority)
+        from System import Action
+        frame = DispatcherFrame()
+        Dispatcher.CurrentDispatcher.BeginInvoke(
+            DispatcherPriority.Background, Action(lambda: setattr(frame, "Continue", False)))
+        Dispatcher.PushFrame(frame)
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -1828,6 +2088,14 @@ class BatchManageSheetsWindow(Window):
         plan["category"] = category
         plan["resolvedDup"] = resolved_dup
 
+        # 新增圖紙的圖號是否與總表(現有 Revit 圖紙)撞號 → 彈窗顯示衝突圖紙資訊並中止。
+        # 特別針對分表匯入：同類別比對看不到別類別已占用的圖號。
+        conflicts = self._find_new_number_conflicts(plan)
+        if conflicts:
+            self._pending_plan = None
+            self._show_new_number_conflicts(conflicts)
+            return
+
         n_changes = (len(plan["new"]) + len(plan["edit"]) + len(plan["toReal"])
                      + len(plan["toPlace"]) + len(plan["delete"]))
         self._pending_plan = plan if n_changes else None
@@ -2024,6 +2292,71 @@ class BatchManageSheetsWindow(Window):
                                  for n in dups))
         return None
 
+    def _find_new_number_conflicts(self, plan):
+        """找出『新增圖紙』的圖號與總表（現有 Revit 圖紙）撞號者。
+
+        圖號在 Revit 必須全域唯一。分表匯入只比對同類別，無法察覺新增圖紙的圖號
+        其實已被『其他類別』的圖紙占用 → 套用時才會失敗。這裡先抓出來。
+        會排除『這次匯入會釋放掉舊圖號』的圖紙（被刪除/降為僅文字、或被改成別的圖號）。
+        回傳 [(新增圖號, 新增圖名, 既有衝突圖紙)]。
+        """
+        freeing = set()  # 這次匯入後會空出圖號的既有圖紙 UID
+        for key in (u"delete", u"toPlace"):
+            for d in plan.get(key, []):
+                s = d.get("sheet")
+                if s is not None:
+                    freeing.add(s.UniqueId)
+        for key in (u"edit", u"toReal"):
+            for d in plan.get(key, []):
+                s = d.get("sheet")
+                newnum = unicode(d.get("num") or u"").strip()
+                if s is not None and newnum and \
+                        newnum != (s.SheetNumber or u"").strip():
+                    freeing.add(s.UniqueId)
+
+        exist_by_num = {}
+        for s in DB.FilteredElementCollector(doc).OfClass(
+                DB.ViewSheet).ToElements():
+            if s.UniqueId in freeing:
+                continue
+            num = (s.SheetNumber or u"").strip()
+            if num and num not in exist_by_num:
+                exist_by_num[num] = s
+
+        conflicts = []
+        for d in plan.get("new", []):
+            num = unicode(d.get("num") or u"").strip()
+            if not num:
+                continue
+            s = exist_by_num.get(num)
+            if s is not None:
+                conflicts.append((num, unicode(d.get("name") or u""), s))
+        return conflicts
+
+    def _show_new_number_conflicts(self, conflicts):
+        """列出『新增圖紙圖號與總表重複』的衝突資訊（唯讀），並中止匯入。"""
+        rows = []
+        for num, new_name, s in conflicts:
+            cat = self._read_text_param(s, u"圖紙類別") or u""
+            rows.append([num, new_name or u"（未命名）",
+                         s.SheetNumber or u"", s.Name or u"", cat])
+        dlg = _ListConfirmWindow(
+            u"新增圖紙的圖號與總表重複",
+            u"以下 {} 筆『新增圖紙』的圖號，在總表（現有 Revit 圖紙）中已被占用。\n"
+            u"圖號在 Revit 必須唯一，已中止匯入。請到 Google Sheet 分表把這些新增列的"
+            u"圖號改成唯一後再匯入；若該列其實是既有圖紙，請改回它原本的 UID。".format(
+                len(rows)),
+            [u"新增圖號", u"新增圖名", u"總表既有圖號", u"總表既有圖名", u"既有圖紙類別"],
+            rows, confirm_label=u"我知道了", cancel_label=u"關閉")
+        try:
+            dlg.Owner = self
+        except Exception:
+            pass
+        dlg.ShowDialog()
+        self._show_sync_msg(
+            u"⚠ 新增圖紙圖號與總表重複，已中止匯入（請改圖號後重試）。",
+            self.COLOR_ERROR)
+
     def _on_import_execute(self, sender, args):
         plan = getattr(self, "_pending_plan", None)
         if not plan:
@@ -2142,11 +2475,154 @@ class BatchManageSheetsWindow(Window):
         self.confirmed = True
         self.Close()
 
+    # ---- 依紅筆圖註解：選後端 → 選 PDF → AI 判讀 → 預覽 → 寫入修正備註 ----
+
     def _on_edit_by_redpen(self, sender, args):
-        forms.alert(u"「依紅筆圖註解」功能開發中（佔位）。\n\n"
-                    u"概念：建築師用紅筆改完圖 → 掃描 → 程式判讀圖框上的圖紙參數\n"
-                    u"辨認是哪一張圖（UID/圖號）→ 把該圖所有紅筆註記寫進『修正備註』。\n"
-                    u"（需接 OCR／AI 影像辨識）")
+        # 1. 跳出「AI 視覺判讀後端」選擇視窗（沒填金鑰會在視窗內提醒並停留）
+        start = _RedpenStartWindow()
+        start.ShowDialog()
+        if not start.confirmed:
+            return
+        provider = start.provider
+
+        cfg = load_gsheet_cfg()
+        keys = cfg.get("ai_keys") or {}
+        models = cfg.get("ai_models") or {}
+        key = (keys.get(provider) or u"").strip()
+        if not key:
+            # 理論上選擇視窗已擋掉；保險再檢一次
+            forms.alert(u"尚未設定「{}」的 API 金鑰。".format(
+                _ai_provider_label(provider)))
+            return
+        model = _ai_model_for(provider, models)
+
+        # 2. 選 PDF（單一檔）
+        path = forms.pick_file(file_ext='pdf')
+        if not path:
+            return
+        if isinstance(path, list):
+            if not path:
+                return
+            path = path[0]
+
+        # 3. 讀檔 → base64
+        try:
+            b64, nbytes = _file_to_base64(path)
+        except Exception as ex:
+            forms.alert(u"讀取 PDF 失敗：{}".format(ex))
+            return
+        mb = nbytes / (1024.0 * 1024.0)
+        if mb > 20:
+            if not forms.alert(
+                    u"這個 PDF 約 {:.1f} MB，可能超過 AI 服務的單次上限而失敗。\n"
+                    u"建議分頁或壓縮後再試。仍要繼續嗎？".format(mb),
+                    yes=True, no=True):
+                return
+
+        # 4. 開「處理進度」小視窗，逐步說明呼叫 AI 判讀過程中發生了什麼
+        prog = _RedpenProgressWindow(_ai_provider_label(provider))
+        try:
+            prog.Owner = self
+        except Exception:
+            pass
+        prog.Show()
+        prog.log(u"① 已讀取 PDF：{}（約 {:.1f} MB）".format(
+            os.path.basename(unicode(path)), mb))
+        prog.log(u"② 正在把整份 PDF 上傳給「{}」並請它判讀紅筆標示…".format(
+            _ai_provider_label(provider)))
+        prog.log(u"　（這一步需要數十秒，期間視窗會像沒有反應，屬正常，請勿關閉）")
+
+        text, err = _redpen_call_ai(
+            provider, model, key, b64, _redpen_build_prompt())
+        if err:
+            err = unicode(err)
+            prog.log(u"✗ 呼叫失敗。")
+            prog.close()
+            self._show_sync_msg(
+                u"❌ AI 呼叫失敗：{}".format(err[:200]), self.COLOR_ERROR)
+            forms.alert(u"AI（{}）呼叫失敗。\n原因／錯誤代碼：\n\n{}".format(
+                _ai_provider_label(provider), err[:1500]))
+            return
+
+        prog.log(u"③ AI 已回覆，正在解析判讀結果（JSON）…")
+        data = _redpen_extract_json(text)
+        if not data or not isinstance(data, dict):
+            prog.close()
+            self._show_sync_msg(u"❌ AI 回應無法解析為 JSON。", self.COLOR_ERROR)
+            forms.alert(u"AI 回應無法解析為 JSON。\n原始回應前 800 字：\n\n{}".format(
+                (text or u"")[:800]))
+            return
+        ai_sheets = data.get("sheets") or []
+        if not ai_sheets:
+            prog.log(u"③ 解析完成：AI 沒有判讀到任何紅筆修改標示。")
+            prog.close()
+            self._show_sync_msg(
+                u"AI 在此 PDF 沒有判讀到任何紅筆修改標示。", self.COLOR_TEXT)
+            forms.alert(u"AI 沒有在這份 PDF 找到紅筆修改標示。")
+            return
+        prog.log(u"③ 解析完成：AI 判讀到 {} 筆修改。".format(len(ai_sheets)))
+
+        # 5. 用圖框上的「圖號」對應 Revit 圖紙（掃描檔沒有 UID）
+        prog.log(u"④ 正在用圖號比對目前 Revit 的圖紙…")
+        by_num = {}
+        for s in DB.FilteredElementCollector(doc).OfClass(
+                DB.ViewSheet).ToElements():
+            by_num[(s.SheetNumber or u"").strip()] = s
+        matched = []   # (sheet, num, name, old_note, new_note)
+        unmatched = []  # (num, note)
+        for item in ai_sheets:
+            try:
+                num = unicode(item.get("sheet_number") or u"").strip()
+                note = unicode(item.get("notes") or u"").strip()
+            except Exception:
+                continue
+            if not note:
+                continue
+            s = by_num.get(num)
+            if s is None:
+                unmatched.append((num, note))
+                continue
+            old = self._read_text_param(s, u"修正備註") or u""
+            matched.append((s, num, s.Name or u"", old, note))
+
+        if not matched:
+            prog.log(u"④ 比對完成：{} 個圖號都對不到 Revit 圖紙。".format(len(unmatched)))
+            prog.close()
+            msg = u"AI 判讀到 {} 筆，但圖號都對不到目前 Revit 的圖紙。".format(
+                len(ai_sheets))
+            if unmatched:
+                msg += u"\n\n對不到的圖號：\n" + u"\n".join(
+                    u"・{}".format(n) for n, _ in unmatched[:20])
+            self._show_sync_msg(u"⚠ 圖號對不到 Revit 圖紙。", self.COLOR_ERROR)
+            forms.alert(msg)
+            return
+
+        prog.log(u"⑤ 比對完成：對到 {} 張、對不到 {} 個圖號。即將開啟預覽…".format(
+            len(matched), len(unmatched)))
+        prog.close()
+
+        # 6. 預覽（逐張選 附加/覆蓋）
+        url = (self.gs_url_box.Text or u"").strip()
+        tab = (self.gs_tab_box.Text or u"").strip()
+        dlg = _RedpenPreviewWindow(matched, unmatched, can_sync=bool(url and tab))
+        try:
+            dlg.Owner = self
+        except Exception:
+            pass
+        dlg.ShowDialog()
+        if not dlg.confirmed:
+            return
+        updates = dlg.get_updates()   # [(uid, final_note), ...]
+        if not updates:
+            forms.alert(u"沒有勾選任何要寫入的圖紙。")
+            return
+
+        # 關窗後由 main() 在交易內套用（與匯入一致，避免被還原）
+        self.result = {"mode": "redpen", "updates": updates,
+                       "url": url, "tab": tab,
+                       "push_to_sheet": bool(dlg.push_to_sheet and url and tab)}
+        self.confirmed = True
+        self.Close()
 
     def _docs_path(self, filename):
         """回傳擴充功能 docs 資料夾下的檔案完整路徑。"""
@@ -3243,6 +3719,504 @@ def _ensure_sheet_schedule(document, want_params):
     return u"已建立「{}」（但未加入欄位，請手動設定）".format(sched_name)
 
 
+class _RedpenStartWindow(Window):
+    """按下「依紅筆圖註解」後跳出：選 AI 視覺判讀後端、可開金鑰設定，再開始。
+    沒填金鑰時提醒並停留在本視窗（不中止），讓使用者當場補金鑰。"""
+
+    def __init__(self):
+        self.confirmed = False
+        self.provider = u"claude"
+
+        self.Title = u"依紅筆圖註解 — 選擇 AI 視覺判讀後端"
+        self.Width = 460
+        self.Height = 240
+        self.WindowStartupLocation = WindowStartupLocation.CenterScreen
+        self.Background = _brush((245, 245, 250))
+
+        cfg = load_gsheet_cfg()
+
+        root = StackPanel()
+        root.Margin = Thickness(18, 16, 18, 16)
+
+        intro = TextBlock()
+        intro.Text = (u"選擇要用哪個 AI 視覺模型判讀紅筆 PDF，按「開始」後再選 PDF 檔。\n"
+                      u"第一次使用請先按「🔑 金鑰／模型設定」填入金鑰。")
+        intro.TextWrapping = TextWrapping.Wrap
+        intro.FontSize = 12
+        intro.Margin = Thickness(0, 0, 0, 14)
+        root.Children.Add(intro)
+
+        row = StackPanel()
+        row.Orientation = Orientation.Horizontal
+        row.Margin = Thickness(0, 0, 0, 8)
+
+        lab = TextBlock()
+        lab.Text = u"後端："
+        lab.VerticalAlignment = VerticalAlignment.Center
+        lab.FontWeight = FontWeights.SemiBold
+        lab.Margin = Thickness(0, 0, 8, 0)
+        row.Children.Add(lab)
+
+        self._combo = ComboBox()
+        self._combo.Width = 200
+        self._combo.Padding = Thickness(4, 3, 4, 3)
+        for _pk, _pl in AI_PROVIDER_LABELS:
+            self._combo.Items.Add(_pl)
+        try:
+            _idx = [pk for pk, _ in AI_PROVIDER_LABELS].index(
+                cfg.get("ai_provider") or u"claude")
+        except Exception:
+            _idx = 0
+        self._combo.SelectedIndex = _idx
+        row.Children.Add(self._combo)
+
+        set_btn = Button()
+        set_btn.Content = u"🔑 金鑰／模型設定"
+        set_btn.Padding = Thickness(10, 4, 10, 4)
+        set_btn.Margin = Thickness(10, 0, 0, 0)
+        set_btn.Click += self._on_settings
+        row.Children.Add(set_btn)
+
+        root.Children.Add(row)
+
+        btns = StackPanel()
+        btns.Orientation = Orientation.Horizontal
+        btns.HorizontalAlignment = HorizontalAlignment.Right
+        btns.Margin = Thickness(0, 18, 0, 0)
+
+        ok = Button()
+        ok.Content = u"開始（選 PDF）"
+        ok.Padding = Thickness(16, 6, 16, 6)
+        ok.Margin = Thickness(0, 0, 8, 0)
+        ok.Background = _brush((99, 102, 241))
+        ok.Foreground = _brush((255, 255, 255))
+        ok.FontWeight = FontWeights.Bold
+        ok.Click += self._on_ok
+        btns.Children.Add(ok)
+
+        cancel = Button()
+        cancel.Content = u"取消"
+        cancel.Padding = Thickness(16, 6, 16, 6)
+        cancel.Click += self._on_cancel
+        btns.Children.Add(cancel)
+
+        root.Children.Add(btns)
+        self.Content = root
+
+    def _selected_provider(self):
+        i = self._combo.SelectedIndex
+        if i is None or i < 0 or i >= len(AI_PROVIDER_LABELS):
+            i = 0
+        return AI_PROVIDER_LABELS[i][0]
+
+    def _has_key(self, provider):
+        cfg = load_gsheet_cfg()
+        return bool(((cfg.get("ai_keys") or {}).get(provider) or u"").strip())
+
+    def _on_settings(self, sender, args):
+        dlg = _AiSettingsWindow()
+        dlg.ShowDialog()
+
+    def _on_ok(self, sender, args):
+        provider = self._selected_provider()
+        if not self._has_key(provider):
+            # 沒設金鑰：直接開「金鑰／模型設定」視窗讓使用者填，不跳警告
+            dlg = _AiSettingsWindow()
+            dlg.ShowDialog()
+            if not self._has_key(provider):
+                # 取消或仍未填該後端金鑰 → 留在本視窗（不中止）
+                return
+        # 記住這次選的後端
+        try:
+            save_gsheet_cfg({"ai_provider": provider})
+        except Exception:
+            pass
+        self.provider = provider
+        self.confirmed = True
+        self.Close()
+
+    def _on_cancel(self, sender, args):
+        self.confirmed = False
+        self.Close()
+
+
+class _RedpenProgressWindow(Window):
+    """依紅筆圖註解的處理進度小視窗：逐步說明呼叫 AI 判讀過程中發生了什麼。
+    非模態（Show）；AI 呼叫在主執行緒同步阻塞，期間視窗會停在最後一句訊息上。"""
+
+    def __init__(self, provider_label):
+        self._closed = False
+        self.Title = u"依紅筆圖註解 — 處理進度"
+        self.Width = 470
+        self.Height = 300
+        self.WindowStartupLocation = WindowStartupLocation.CenterOwner
+        self.Background = _brush((245, 245, 250))
+        self.Closed += self._on_closed
+
+        root = Grid()
+        root.Margin = Thickness(16, 14, 16, 14)
+        root.RowDefinitions.Add(RowDefinition(Height=GridLength(1, GridUnitType.Auto)))
+        root.RowDefinitions.Add(RowDefinition(Height=GridLength(1, GridUnitType.Star)))
+        root.RowDefinitions.Add(RowDefinition(Height=GridLength(1, GridUnitType.Auto)))
+
+        head = TextBlock()
+        head.Text = u"正在以「{}」判讀紅筆 PDF".format(provider_label)
+        head.FontWeight = FontWeights.Bold
+        head.FontSize = 13
+        head.Margin = Thickness(0, 0, 0, 8)
+        Grid.SetRow(head, 0)
+        root.Children.Add(head)
+
+        sv = ScrollViewer()
+        sv.VerticalScrollBarVisibility = ScrollBarVisibility.Auto
+        sv.Background = _brush((255, 255, 255))
+        sv.BorderBrush = _brush((200, 205, 215))
+        sv.BorderThickness = Thickness(1)
+        sv.Padding = Thickness(8, 8, 8, 8)
+        self._sv = sv
+        self._log = TextBlock()
+        self._log.Text = u""
+        self._log.TextWrapping = TextWrapping.Wrap
+        self._log.FontSize = 12
+        sv.Content = self._log
+        Grid.SetRow(sv, 1)
+        root.Children.Add(sv)
+
+        foot = TextBlock()
+        foot.Text = u"完成後會自動關閉並開啟預覽，請勿手動關閉本視窗。"
+        foot.FontSize = 11
+        foot.Foreground = _brush((130, 135, 145))
+        foot.Margin = Thickness(0, 8, 0, 0)
+        Grid.SetRow(foot, 2)
+        root.Children.Add(foot)
+
+        self.Content = root
+
+    def _on_closed(self, sender, args):
+        self._closed = True
+
+    def log(self, line):
+        if self._closed:
+            return
+        try:
+            self._log.Text = (self._log.Text or u"") + line + u"\n"
+            self._sv.ScrollToEnd()
+            _doevents()
+        except Exception:
+            pass
+
+    def close(self):
+        if self._closed:
+            return
+        try:
+            self.Close()
+        except Exception:
+            pass
+
+
+class _AiSettingsWindow(Window):
+    """AI 金鑰／模型設定：三家各一組（金鑰遮蔽、模型可改），存進 baf_gsheet_config.json。"""
+
+    def __init__(self):
+        self.Title = u"AI 金鑰／模型設定"
+        self.Width = 560
+        self.Height = 420
+        self.WindowStartupLocation = WindowStartupLocation.CenterScreen
+        self.Background = _brush((245, 245, 250))
+
+        cfg = load_gsheet_cfg()
+        keys = cfg.get("ai_keys") or {}
+        models = cfg.get("ai_models") or {}
+
+        root = StackPanel()
+        root.Margin = Thickness(18, 16, 18, 16)
+
+        intro = TextBlock()
+        intro.Text = (u"填入你要使用的 AI 服務金鑰（只存在本機設定檔，不會進 git）。\n"
+                      u"模型留空＝使用預設。")
+        intro.TextWrapping = TextWrapping.Wrap
+        intro.FontSize = 12
+        intro.Margin = Thickness(0, 0, 0, 12)
+        root.Children.Add(intro)
+
+        self._key_boxes = {}    # provider -> PasswordBox
+        self._model_boxes = {}  # provider -> TextBox
+        for pk, pl in AI_PROVIDER_LABELS:
+            lab = TextBlock()
+            lab.Text = pl
+            lab.FontWeight = FontWeights.Bold
+            lab.FontSize = 12
+            lab.Margin = Thickness(0, 6, 0, 4)
+            root.Children.Add(lab)
+
+            row = Grid()
+            row.ColumnDefinitions.Add(
+                ColumnDefinition(Width=GridLength(2, GridUnitType.Star)))
+            row.ColumnDefinitions.Add(
+                ColumnDefinition(Width=GridLength(1, GridUnitType.Star)))
+            row.Margin = Thickness(0, 0, 0, 6)
+
+            kb = PasswordBox()
+            kb.Padding = Thickness(4, 4, 4, 4)
+            kb.Margin = Thickness(0, 0, 6, 0)
+            try:
+                kb.Password = keys.get(pk) or u""
+            except Exception:
+                pass
+            Grid.SetColumn(kb, 0)
+            row.Children.Add(kb)
+            self._key_boxes[pk] = kb
+
+            mb = TextBox()
+            mb.Padding = Thickness(4, 4, 4, 4)
+            mb.Text = models.get(pk) or u""
+            try:
+                mb.ToolTip = u"預設：{}".format(AI_DEFAULT_MODELS.get(pk) or u"")
+            except Exception:
+                pass
+            Grid.SetColumn(mb, 1)
+            row.Children.Add(mb)
+            self._model_boxes[pk] = mb
+
+            hint = TextBlock()
+            hint.Text = u"（金鑰　／　模型，預設 {}）".format(
+                AI_DEFAULT_MODELS.get(pk) or u"")
+            hint.FontSize = 10
+            hint.Foreground = _brush((130, 135, 145))
+            hint.Margin = Thickness(0, 0, 0, 4)
+            root.Children.Add(row)
+            root.Children.Add(hint)
+
+        btns = StackPanel()
+        btns.Orientation = Orientation.Horizontal
+        btns.HorizontalAlignment = HorizontalAlignment.Right
+        btns.Margin = Thickness(0, 14, 0, 0)
+
+        save = Button()
+        save.Content = u"儲存"
+        save.Padding = Thickness(16, 6, 16, 6)
+        save.Margin = Thickness(0, 0, 8, 0)
+        save.Background = _brush((99, 102, 241))
+        save.Foreground = _brush((255, 255, 255))
+        save.FontWeight = FontWeights.Bold
+        save.Click += self._on_save
+        btns.Children.Add(save)
+
+        cancel = Button()
+        cancel.Content = u"取消"
+        cancel.Padding = Thickness(16, 6, 16, 6)
+        cancel.Click += self._on_cancel
+        btns.Children.Add(cancel)
+
+        root.Children.Add(btns)
+        self.Content = root
+
+    def _on_save(self, sender, args):
+        keys, models = {}, {}
+        for pk, _ in AI_PROVIDER_LABELS:
+            try:
+                keys[pk] = (self._key_boxes[pk].Password or u"").strip()
+            except Exception:
+                keys[pk] = u""
+            models[pk] = (self._model_boxes[pk].Text or u"").strip()
+        save_gsheet_cfg({"ai_keys": keys, "ai_models": models})
+        self.Close()
+
+    def _on_cancel(self, sender, args):
+        self.Close()
+
+
+class _RedpenPreviewWindow(Window):
+    """依紅筆圖註解預覽：逐張顯示現有備註 vs AI 判讀，並各自選『附加／覆蓋』。"""
+
+    SEP = u"\n"  # 附加時，舊備註與新內容之間的分隔
+
+    def __init__(self, matched, unmatched, can_sync):
+        self.confirmed = False
+        self.push_to_sheet = False
+        self._matched = matched          # (sheet, num, name, old, new)
+        self._can_sync = can_sync
+        self._rows = []                  # {sheet, old, new, chk, mode}
+
+        self.Title = u"依紅筆圖註解 — 預覽（逐張確認）"
+        self.Width = 980
+        self.Height = 640
+        self.WindowStartupLocation = WindowStartupLocation.CenterScreen
+        self.Background = _brush((245, 245, 250))
+
+        root = Grid()
+        root.Margin = Thickness(16, 14, 16, 14)
+        root.RowDefinitions.Add(RowDefinition(Height=GridLength(1, GridUnitType.Auto)))
+        root.RowDefinitions.Add(RowDefinition(Height=GridLength(1, GridUnitType.Star)))
+        root.RowDefinitions.Add(RowDefinition(Height=GridLength(1, GridUnitType.Auto)))
+
+        head = TextBlock()
+        head.Text = (u"AI 判讀到 {} 張可對應的圖。請確認每張的『處理方式』"
+                     u"（附加＝保留原備註並接在後面；覆蓋＝以 AI 內容取代）。".format(
+                         len(matched)))
+        head.TextWrapping = TextWrapping.Wrap
+        head.FontSize = 13
+        head.FontWeight = FontWeights.Bold
+        head.Margin = Thickness(0, 0, 0, 10)
+        Grid.SetRow(head, 0)
+        root.Children.Add(head)
+
+        sv = ScrollViewer()
+        sv.VerticalScrollBarVisibility = ScrollBarVisibility.Visible
+        sv.HorizontalScrollBarVisibility = ScrollBarVisibility.Auto
+        sv.Background = _brush((255, 255, 255))
+        sv.BorderBrush = _brush((200, 205, 215))
+        sv.BorderThickness = Thickness(1)
+        sv.Padding = Thickness(8, 8, 8, 8)
+        sv.Content = self._build_table(matched, unmatched)
+        Grid.SetRow(sv, 1)
+        root.Children.Add(sv)
+
+        bottom = StackPanel()
+        bottom.Orientation = Orientation.Horizontal
+        bottom.Margin = Thickness(0, 12, 0, 0)
+
+        self._sync_chk = CheckBox()
+        self._sync_chk.Content = u"同時同步到 Google Sheet"
+        self._sync_chk.VerticalAlignment = VerticalAlignment.Center
+        self._sync_chk.IsChecked = bool(can_sync)
+        self._sync_chk.IsEnabled = bool(can_sync)
+        if not can_sync:
+            self._sync_chk.Content = u"同時同步到 Google Sheet（需先填 URL／頁籤）"
+        bottom.Children.Add(self._sync_chk)
+
+        spacer = TextBlock()
+        spacer.Width = 30
+        bottom.Children.Add(spacer)
+
+        ok = Button()
+        ok.Content = u"確認寫入"
+        ok.Padding = Thickness(16, 6, 16, 6)
+        ok.Margin = Thickness(0, 0, 8, 0)
+        ok.Background = _brush((34, 139, 34))
+        ok.Foreground = _brush((255, 255, 255))
+        ok.FontWeight = FontWeights.Bold
+        ok.Click += self._on_ok
+        bottom.Children.Add(ok)
+
+        cancel = Button()
+        cancel.Content = u"取消"
+        cancel.Padding = Thickness(16, 6, 16, 6)
+        cancel.Click += self._on_cancel
+        bottom.Children.Add(cancel)
+
+        Grid.SetRow(bottom, 2)
+        root.Children.Add(bottom)
+        self.Content = root
+
+    def _build_table(self, matched, unmatched):
+        outer = StackPanel()
+
+        grid = Grid()
+        headers = [u"套用", u"圖號", u"圖名", u"現有修正備註", u"AI 判讀內容", u"處理方式"]
+        widths = [GridLength(1, GridUnitType.Auto),
+                  GridLength(1, GridUnitType.Auto),
+                  GridLength(150),
+                  GridLength(230),
+                  GridLength(300),
+                  GridLength(1, GridUnitType.Auto)]
+        for w in widths:
+            grid.ColumnDefinitions.Add(ColumnDefinition(Width=w))
+        for _ in range(len(matched) + 1):
+            grid.RowDefinitions.Add(
+                RowDefinition(Height=GridLength(1, GridUnitType.Auto)))
+
+        for c, h in enumerate(headers):
+            tb = TextBlock()
+            tb.Text = h
+            tb.FontWeight = FontWeights.Bold
+            tb.Margin = Thickness(6, 2, 12, 6)
+            Grid.SetRow(tb, 0)
+            Grid.SetColumn(tb, c)
+            grid.Children.Add(tb)
+
+        for r, (sheet, num, name, old, new) in enumerate(matched):
+            chk = CheckBox()
+            chk.IsChecked = True
+            chk.VerticalAlignment = VerticalAlignment.Center
+            chk.Margin = Thickness(6, 4, 12, 4)
+            Grid.SetRow(chk, r + 1)
+            Grid.SetColumn(chk, 0)
+            grid.Children.Add(chk)
+
+            grid.Children.Add(self._cell(num, r + 1, 1, bold=True))
+            grid.Children.Add(self._cell(name, r + 1, 2))
+            grid.Children.Add(self._cell(old if old else u"（空）", r + 1, 3,
+                                         color=(120, 120, 130)))
+            grid.Children.Add(self._cell(new, r + 1, 4))
+
+            mode = ComboBox()
+            mode.Items.Add(u"附加")
+            mode.Items.Add(u"覆蓋")
+            mode.SelectedIndex = 0 if old else 1
+            mode.Margin = Thickness(6, 4, 6, 4)
+            mode.VerticalAlignment = VerticalAlignment.Center
+            Grid.SetRow(mode, r + 1)
+            Grid.SetColumn(mode, 5)
+            grid.Children.Add(mode)
+
+            self._rows.append({"sheet": sheet, "old": old, "new": new,
+                               "chk": chk, "mode": mode})
+
+        outer.Children.Add(grid)
+
+        if unmatched:
+            warn = TextBlock()
+            warn.Text = (u"\n⚠ 以下 {} 個圖號對不到目前 Revit 的圖紙，已略過：\n".format(
+                len(unmatched)) + u"\n".join(
+                u"・{}　{}".format(n, (note[:40] + u"…") if len(note) > 40 else note)
+                for n, note in unmatched))
+            warn.TextWrapping = TextWrapping.Wrap
+            warn.FontSize = 11
+            warn.Foreground = _brush((180, 60, 60))
+            warn.Margin = Thickness(2, 10, 2, 2)
+            outer.Children.Add(warn)
+
+        return outer
+
+    def _cell(self, text, row, col, bold=False, color=None):
+        tb = TextBlock()
+        tb.Text = text if text is not None else u""
+        tb.TextWrapping = TextWrapping.Wrap
+        tb.Margin = Thickness(6, 4, 12, 4)
+        if bold:
+            tb.FontWeight = FontWeights.Bold
+        if color is not None:
+            tb.Foreground = _brush(color)
+        Grid.SetRow(tb, row)
+        Grid.SetColumn(tb, col)
+        return tb
+
+    def get_updates(self):
+        """回傳勾選的 [(UniqueId, 最終備註)]。附加＝舊＋分隔＋新；覆蓋＝新。"""
+        out = []
+        for row in self._rows:
+            if not row["chk"].IsChecked:
+                continue
+            old, new = row["old"], row["new"]
+            overwrite = (row["mode"].SelectedIndex == 1)
+            if overwrite or not old:
+                final = new
+            else:
+                final = old + self.SEP + new
+            out.append((row["sheet"].UniqueId, final))
+        return out
+
+    def _on_ok(self, sender, args):
+        self.push_to_sheet = bool(self._can_sync and self._sync_chk.IsChecked)
+        self.confirmed = True
+        self.Close()
+
+    def _on_cancel(self, sender, args):
+        self.confirmed = False
+        self.Close()
+
+
 # ---------------------------------------------------------------------------
 # 主流程
 # ---------------------------------------------------------------------------
@@ -3268,6 +4242,23 @@ def _open_manager_window(initial_tab=None):
             win.tabs.SelectedIndex = initial_tab
         except Exception:
             pass
+    # 讓視窗固定停在 Revit 主視窗之上（不會被 Revit 蓋住），直到使用者自行關閉。
+    # 作法：把 Revit 主視窗設為本視窗的 Owner（本腳本就跑在 Revit 行程內）。
+    try:
+        from System.Windows.Interop import WindowInteropHelper
+        from System.Diagnostics import Process
+        from System import IntPtr
+        rvt_handle = Process.GetCurrentProcess().MainWindowHandle
+        if rvt_handle != IntPtr.Zero:
+            WindowInteropHelper(win).Owner = rvt_handle
+        else:
+            win.Topmost = True
+    except Exception:
+        try:
+            win.Topmost = True
+        except Exception:
+            pass
+
     AppDomain.CurrentDomain.SetData(_WKEY, win)
     win.ShowDialog()
     # 只有當記錄的還是自己時才清掉（避免清掉後開的新視窗）
@@ -3385,16 +4376,80 @@ def main():
                         "（其他階段與分表未變動）。".format(cat))
                 else:
                     output.print_md("\n⚠ 自動回寫回應異常：{}".format(res))
-            elif not is_err and (done.get("new", 0) > 0 or done.get("toPlace", 0) > 0
-                                 or plan.get("resolvedDup")):
-                # 總表匯入：有新增/刪除重建(UID 變動) 或 解決過重複圖號 → 自動回寫
-                res, err, n = win._do_export(plan["url"], main_tab)
+            elif not is_err:
+                # 總表匯入後的自動回寫
+                changed = any(done.get(k, 0) for k in
+                              ("new", "edit", "toReal", "toPlace", "delete"))
+                # 只有 UID 會變動(新建/降為僅文字)或解決過重複圖號時，才需要回寫總表本身
+                need_main = (done.get("new", 0) > 0 or done.get("toPlace", 0) > 0
+                             or plan.get("resolvedDup"))
+                if need_main:
+                    res, err, n = win._do_export(plan["url"], main_tab)
+                    if err:
+                        output.print_md("\n⚠ 自動回寫總表失敗：{}".format(err))
+                    elif res and res.get("ok"):
+                        output.print_md("\n🔄 已自動回寫總表（更新變動/新建的 UID、已修正的重複圖號）。")
+                    else:
+                        output.print_md("\n⚠ 自動回寫總表回應異常：{}".format(res))
+                # 修正：先前這裡只更新總表、漏了分表。只要有變動就一併重建所有分表，
+                # 讓分表內容與總表同步（與手動「匯出後拆分」相同的拆分邏輯）。
+                if changed or plan.get("resolvedDup"):
+                    sres, serr, _ = win._do_split(plan["url"], main_tab)
+                    if serr:
+                        output.print_md("\n⚠ 分表自動更新失敗：{}".format(serr))
+                    elif sres and sres.get("ok"):
+                        made = sres.get("splitTabs") or []
+                        output.print_md(
+                            "\n🗂️ 已一併更新所有分表（{} 個：{}）。".format(
+                                len(made), u"、".join(made))
+                            if made else
+                            "\n🗂️ 已重建分表（目前沒有可依圖紙類別拆分的資料）。")
+                    else:
+                        output.print_md("\n⚠ 分表自動更新回應異常：{}".format(sres))
+            return
+
+        elif mode == "redpen":
+            updates = win.result.get("updates") or []
+            url = win.result.get("url") or u""
+            tab = win.result.get("tab") or u""
+            push = win.result.get("push_to_sheet")
+            by_uid = dict(
+                (s.UniqueId, s) for s in
+                DB.FilteredElementCollector(doc).OfClass(DB.ViewSheet).ToElements())
+            ok_n, fails = 0, []
+            try:
+                with revit.Transaction("BaF 依紅筆圖註解寫入修正備註"):
+                    for uid, note in updates:
+                        s = by_uid.get(uid)
+                        if s is None:
+                            fails.append((uid, u"找不到圖紙"))
+                            continue
+                        try:
+                            win._set_param(s, u"修正備註", note)
+                            ok_n += 1
+                        except Exception as ex:
+                            fails.append((uid, unicode(ex)))
+            except Exception as ex:
+                output.print_md("# ❌ 依紅筆圖註解：寫入失敗，已自動復原")
+                output.print_md("- {}".format(ex))
+                return
+
+            output.print_md("# 🖍 依紅筆圖註解")
+            output.print_md("- 已更新「修正備註」：**{}** 張".format(ok_n))
+            if fails:
+                output.print_md("- ⚠ 失敗 {} 張".format(len(fails)))
+                for uid, reason in fails[:15]:
+                    output.print_md("  - `{}`: {}".format(uid[:8], reason))
+
+            if push and ok_n and url and tab:
+                res, err, _ = win._do_export(url, tab)
                 if err:
-                    output.print_md("\n⚠ 自動回寫 Google Sheet 失敗：{}".format(err))
+                    output.print_md("\n⚠ 同步 Google Sheet 失敗：{}".format(err))
                 elif res and res.get("ok"):
-                    output.print_md("\n🔄 已自動回寫 Google Sheet（更新變動/新建的 UID、已修正的重複圖號）。")
+                    output.print_md(
+                        "\n🔄 已把含新修正備註的總表同步到 Google Sheet。")
                 else:
-                    output.print_md("\n⚠ 自動回寫回應異常：{}".format(res))
+                    output.print_md("\n⚠ 同步回應異常：{}".format(res))
             return
 
         # 其他模式：處理完就結束

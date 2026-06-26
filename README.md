@@ -89,7 +89,9 @@ pyrevit extend ui BaF https://github.com/b00204002-spec/BaF.extension.git --bran
 
 ```
 BaF.extension/
-└── Tools.tab/                              ← Revit 頁籤 (title: BaF)
+├── hooks/                                 ← pyRevit 事件掛勾
+│   └── view-activated.py                  ← 切換到圖紙時，有「修正備註」就跳視窗列出
+└── Tools.tab/                             ← Revit 頁籤 (title: BaF)
     ├── Views.panel/                        ← 視圖工具
     │   ├── AlignViewports.pushbutton/
     │   ├── BatchApplyViewProps.pushbutton/
