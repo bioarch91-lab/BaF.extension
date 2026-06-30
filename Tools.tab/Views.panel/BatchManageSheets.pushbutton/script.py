@@ -2538,10 +2538,22 @@ class BatchManageSheetsWindow(Window):
             err = unicode(err)
             prog.log(u"✗ 呼叫失敗。")
             prog.close()
+            # 把「完整」錯誤寫到暫存檔，方便整段複製(forms.alert 會截斷/難複製)
+            logp = u""
+            try:
+                import tempfile
+                import io
+                logp = os.path.join(tempfile.gettempdir(), u"baf_redpen_error.txt")
+                with io.open(logp, "w", encoding="utf-8") as f:
+                    f.write(u"provider={}\nmodel={}\n\n{}".format(
+                        provider, model, err))
+            except Exception:
+                logp = u""
             self._show_sync_msg(
                 u"❌ AI 呼叫失敗：{}".format(err[:200]), self.COLOR_ERROR)
-            forms.alert(u"AI（{}）呼叫失敗。\n原因／錯誤代碼：\n\n{}".format(
-                _ai_provider_label(provider), err[:1500]))
+            forms.alert(u"AI（{}，模型 {}）呼叫失敗。\n原因／錯誤代碼：\n\n{}{}".format(
+                _ai_provider_label(provider), model, err[:1500],
+                (u"\n\n（完整錯誤已寫到：{}）".format(logp) if logp else u"")))
             return
 
         prog.log(u"③ AI 已回覆，正在解析判讀結果（JSON）…")
@@ -2563,12 +2575,16 @@ class BatchManageSheetsWindow(Window):
         prog.log(u"③ 解析完成：AI 判讀到 {} 筆修改。".format(len(ai_sheets)))
 
         # 5. 用圖框上的「圖號」對應 Revit 圖紙（掃描檔沒有 UID）
+        #    Revit 圖號唯一 → 一個圖號對一張圖。PDF 若有「同圖號、不同圖名」的多頁，
+        #    會全部對到同一張 Revit 圖紙 → 先把這些頁的備註「合併」成一筆(用「；」)，
+        #    避免互相覆蓋而遺失。圖名不參與比對，僅供顯示。
         prog.log(u"④ 正在用圖號比對目前 Revit 的圖紙…")
         by_num = {}
         for s in DB.FilteredElementCollector(doc).OfClass(
                 DB.ViewSheet).ToElements():
             by_num[(s.SheetNumber or u"").strip()] = s
-        matched = []   # (sheet, num, name, old_note, new_note)
+        acc = {}        # uid -> {"sheet", "num", "notes": [..]}
+        acc_order = []  # 保持出現順序
         unmatched = []  # (num, note)
         for item in ai_sheets:
             try:
@@ -2582,8 +2598,18 @@ class BatchManageSheetsWindow(Window):
             if s is None:
                 unmatched.append((num, note))
                 continue
+            uid = s.UniqueId
+            if uid not in acc:
+                acc[uid] = {"sheet": s, "num": num, "notes": []}
+                acc_order.append(uid)
+            acc[uid]["notes"].append(note)
+        matched = []   # (sheet, num, name, old_note, new_note)
+        for uid in acc_order:
+            a = acc[uid]
+            s = a["sheet"]
             old = self._read_text_param(s, u"修正備註") or u""
-            matched.append((s, num, s.Name or u"", old, note))
+            combined = u"；".join(a["notes"])   # 同圖號多頁的備註合併
+            matched.append((s, a["num"], s.Name or u"", old, combined))
 
         if not matched:
             prog.log(u"④ 比對完成：{} 個圖號都對不到 Revit 圖紙。".format(len(unmatched)))
@@ -4029,7 +4055,8 @@ class _AiSettingsWindow(Window):
 class _RedpenPreviewWindow(Window):
     """依紅筆圖註解預覽：逐張顯示現有備註 vs AI 判讀，並各自選『附加／覆蓋』。"""
 
-    SEP = u"\n"  # 附加時，舊備註與新內容之間的分隔
+    SEP = u"；"  # 附加時，舊備註與新內容之間的分隔（用全形分號而非換行，
+    #             因 Revit 明細表儲存格遇換行只顯示第一行 → 改用「；」同一行顯示完整內容）
 
     def __init__(self, matched, unmatched, can_sync):
         self.confirmed = False
@@ -4424,18 +4451,28 @@ def main():
                         if s is None:
                             fails.append((uid, u"找不到圖紙"))
                             continue
+                        # 明確檢查「修正備註」參數是否存在/可寫，避免靜默跳過卻誤報成功
+                        p = _lookup_sheet_param(s, u"修正備註")
+                        if p is None:
+                            fails.append((s.SheetNumber or uid[:8],
+                                          u"此圖沒有『修正備註』參數，請先按「🛠️ 建立環境」"))
+                            continue
+                        if p.IsReadOnly:
+                            fails.append((s.SheetNumber or uid[:8], u"『修正備註』為唯讀"))
+                            continue
                         try:
                             win._set_param(s, u"修正備註", note)
                             ok_n += 1
                         except Exception as ex:
-                            fails.append((uid, unicode(ex)))
+                            fails.append((s.SheetNumber or uid[:8], unicode(ex)))
             except Exception as ex:
                 output.print_md("# ❌ 依紅筆圖註解：寫入失敗，已自動復原")
                 output.print_md("- {}".format(ex))
                 return
 
             output.print_md("# 🖍 依紅筆圖註解")
-            output.print_md("- 已更新「修正備註」：**{}** 張".format(ok_n))
+            output.print_md("- ✍️ 已**寫入 Revit「修正備註」參數**：**{}** 張"
+                            "（在圖紙屬性面板或圖紙明細表可看到；開圖也會彈出顯示）".format(ok_n))
             if fails:
                 output.print_md("- ⚠ 失敗 {} 張".format(len(fails)))
                 for uid, reason in fails[:15]:

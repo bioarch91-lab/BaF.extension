@@ -163,6 +163,9 @@ function writeIndexToSheet(sh, records, labels, checkboxLabel, dropdownLabels, u
         }
       } catch (e3) { note += l + '下拉失敗:' + e3 + '; '; }
     });
+
+    // 「已完成」開頭的修正備註條目 → 反灰
+    applyDoneGreyByText_(sh, dataStart, records, colOf['修正備註']);
   }
 
   // 更新時間
@@ -185,6 +188,40 @@ function writeIndexToSheet(sh, records, labels, checkboxLabel, dropdownLabels, u
   }
 
   return { headerRow: headerRow, checkboxCol: (colOf[checkboxLabel] || 0), locked: locked, note: note };
+}
+
+
+// 依「已完成」規則，回傳整格「修正備註」的 RichTextValue：
+// 以「；」分隔，凡(去前導空白後)以「已完成」開頭的條目塗灰(#999)，其餘明確設黑字(#000)。
+// 明確設黑 → 在 Sheet 編輯時可把舊的灰字「重設」成黑字(新內容與舊內容可區分)。
+function _noteRich_(full) {
+  var black = SpreadsheetApp.newTextStyle().setForegroundColor('#000000').build();
+  var grey = SpreadsheetApp.newTextStyle().setForegroundColor('#999999').build();
+  var rich = SpreadsheetApp.newRichTextValue().setText(full).setTextStyle(black);
+  var parts = full.split('；');
+  var pos = 0;
+  for (var j = 0; j < parts.length; j++) {
+    var seg = parts[j];
+    var segStart = pos, segEnd = pos + seg.length;
+    if (segEnd > segStart && seg.replace(/^\s+/, '').indexOf('已完成') === 0) {
+      rich.setTextStyle(segStart, segEnd, grey);
+    }
+    pos = segEnd + 1;   // +1 跳過分隔符「；」
+  }
+  return rich.build();
+}
+
+// 匯出時：含「已完成」條目的「修正備註」格依規則上色(其餘列已是純值黑字，略過以省效能)。
+function applyDoneGreyByText_(sh, dataStart, records, noteCol) {
+  try {
+    if (!noteCol) return;
+    for (var i = 0; i < records.length; i++) {
+      var rec = records[i] || {};
+      var full = (rec['修正備註'] == null) ? '' : String(rec['修正備註']);
+      if (!full || full.indexOf('已完成') < 0) continue;
+      try { sh.getRange(dataStart + i, noteCol).setRichTextValue(_noteRich_(full)); } catch (e1) {}
+    }
+  } catch (e) {}
 }
 
 // 依「圖紙類別」拆成多個工作表，每類一個分頁、以類別命名
@@ -342,6 +379,9 @@ function writeSubSheet(sh, records, labels, checkboxLabel, dropdownLabels, updat
         }
       } catch (e3) {}
     });
+
+    // 「已完成」開頭的修正備註條目 → 反灰
+    applyDoneGreyByText_(sh, dataStart, records, colOf['修正備註']);
   }
 
   // 凍結到欄位表頭列（更新時間＋批次參數＋欄位表頭都算表頭）
@@ -527,52 +567,93 @@ function headerInfo(sh) {
 }
 
 // 編輯「附表」時，自動把同一張圖(以 UID 對應)的值寫回「總表」
+// 分表↔總表「值編輯」自動雙向即時同步（依 UID 比對）：
+//   編輯分表某格 → 寫回總表對應列；編輯總表某格 → 寫到含該 UID 的分表對應列。
+// 不處理整列新增/刪除（onEdit 不會在刪/增列時觸發）；結構變更請在 Revit 端做後匯出。
+// 安全：簡單觸發器 onEdit 由「使用者手動編輯」觸發；本函式以程式 setValue() 寫入對方，
+//       程式寫入不會再觸發簡單觸發器，故不會無限迴圈。
 function onEdit(e) {
   try {
     if (!e || !e.range) return;
     const sh = e.range.getSheet();
-    if (getRole(sh) !== 'sub') return;          // 只處理附表的編輯
-    const ss = e.source;
-    let main = null;
-    const sheets = ss.getSheets();
-    for (let i = 0; i < sheets.length; i++) {
-      if (getRole(sheets[i]) === 'main') { main = sheets[i]; break; }
-    }
-    if (!main) return;
-    const subInfo = headerInfo(sh);
-    const mainInfo = headerInfo(main);
-    if (!subInfo || !mainInfo) return;
-    const subUidCol = subInfo.colOf['UID'];
-    if (!subUidCol || !mainInfo.colOf['UID']) return;
+    const role = getRole(sh);
+    if (role !== 'sub' && role !== 'main') return;   // 只處理總表/分表
+    const srcInfo = headerInfo(sh);
+    if (!srcInfo || !srcInfo.colOf['UID']) return;
 
-    // 主表 UID -> 列
-    const mMap = {};
-    const mLast = main.getLastRow();
-    const mStart = mainInfo.headerRow + 1;
-    if (mLast >= mStart) {
-      const us = main.getRange(mStart, mainInfo.colOf['UID'], mLast - mStart + 1, 1).getValues();
-      for (let i = 0; i < us.length; i++) {
-        const u = String(us[i][0] || '').trim();
-        if (u) mMap[u] = mStart + i;
+    // 修正備註即時上色：使用者在 Sheet 改「修正備註」格 → 依「已完成」規則重上色
+    //   (新內容無已完成→黑字、已完成→灰字)，讓新舊內容可區分。不依賴是否有同步目標。
+    const _ncol = srcInfo.colOf['修正備註'];
+    if (_ncol) {
+      const er = e.range;
+      const rr0 = er.getRow(), cc0 = er.getColumn();
+      const rrn = er.getNumRows(), ccn = er.getNumColumns();
+      if (_ncol >= cc0 && _ncol <= cc0 + ccn - 1) {
+        for (let k = 0; k < rrn; k++) {
+          const rw = rr0 + k;
+          if (rw <= srcInfo.headerRow) continue;
+          const v = String(sh.getRange(rw, _ncol).getValue() || '');
+          if (v) { try { sh.getRange(rw, _ncol).setRichTextValue(_noteRich_(v)); } catch (e0) {} }
+        }
       }
     }
+
+    const ss = e.source;
+    const sheets = ss.getSheets();
+
+    // 決定要寫入的目標：分表編輯→單一總表；總表編輯→所有分表
+    const targets = [];
+    for (let i = 0; i < sheets.length; i++) {
+      const tr = getRole(sheets[i]);
+      if (role === 'sub' && tr === 'main') { targets.push(sheets[i]); break; }
+      if (role === 'main' && tr === 'sub') { targets.push(sheets[i]); }
+    }
+    if (!targets.length) return;
+
+    // 預先建每個目標的 UID -> 列 對照
+    const tgt = targets.map(function (t) {
+      const info = headerInfo(t);
+      const map = {};
+      if (info && info.colOf['UID']) {
+        const last = t.getLastRow(), start = info.headerRow + 1;
+        if (last >= start) {
+          const us = t.getRange(start, info.colOf['UID'], last - start + 1, 1).getValues();
+          for (let i = 0; i < us.length; i++) {
+            const u = String(us[i][0] || '').trim();
+            if (u) map[u] = start + i;
+          }
+        }
+      }
+      return { sheet: t, info: info, map: map };
+    });
 
     const r0 = e.range.getRow(), c0 = e.range.getColumn();
     const nR = e.range.getNumRows(), nC = e.range.getNumColumns();
     for (let rr = 0; rr < nR; rr++) {
       const row = r0 + rr;
-      if (row <= subInfo.headerRow) continue;
-      const uid = String(sh.getRange(row, subUidCol).getValue() || '').trim();
+      if (row <= srcInfo.headerRow) continue;
+      const uid = String(sh.getRange(row, srcInfo.colOf['UID']).getValue() || '').trim();
       if (!uid) continue;
-      const mrow = mMap[uid];
-      if (!mrow) continue;
       for (let cc = 0; cc < nC; cc++) {
         const col = c0 + cc;
-        const label = subInfo.labelByCol[col];
-        if (!label || label === 'UID') continue;   // UID 不改
-        const mcol = mainInfo.colOf[label];
-        if (!mcol) continue;
-        main.getRange(mrow, mcol).setValue(sh.getRange(row, col).getValue());
+        const label = srcInfo.labelByCol[col];
+        if (!label || label === 'UID') continue;     // UID 不改
+        const val = sh.getRange(row, col).getValue();
+        const isNote = (label === '修正備註');   // 來源格已在上面即時上色
+        const sval = String(val == null ? '' : val);
+        for (let ti = 0; ti < tgt.length; ti++) {
+          const td = tgt[ti];
+          if (!td.info || !td.info.colOf[label]) continue;
+          const trow = td.map[uid];
+          if (!trow) continue;                         // 對方沒有這個 UID 就略過
+          const tcell = td.sheet.getRange(trow, td.info.colOf[label]);
+          if (isNote) {
+            if (sval) { try { tcell.setRichTextValue(_noteRich_(sval)); } catch (eT) {} }
+            else { tcell.setValue(''); }
+          } else {
+            tcell.setValue(val);
+          }
+        }
       }
     }
   } catch (err) { /* onEdit 不可拋錯，避免影響使用者編輯 */ }
@@ -597,10 +678,9 @@ const BAF_REQUIRED_LABELS = ['UID', '圖紙名稱', '圖紙號碼'];
 function onOpen() {
   try {
     const ui = SpreadsheetApp.getUi();
+    // 分表↔總表的「值編輯」已由 onEdit 自動雙向同步，不再需要手動同步選單。
+    // 新增/刪除圖紙等結構變更請在 Revit 端做，匯出時會自動重建總表與所有分表。
     ui.createMenu('BaF')
-      .addItem('① 分表 → 更新總表', 'bafShowSubsToMainDialog')
-      .addItem('② 總表 → 更新分表', 'bafShowMainToSubsDialog')
-      .addSeparator()
       .addSubMenu(ui.createMenu('設定目前工作表角色')
         .addItem('設為總表(main)', 'bafMarkMain')
         .addItem('設為分表(sub)', 'bafMarkSub')
@@ -842,6 +922,9 @@ function bafBuildSubsToMain_(subNames, mainName) {
     if (!sub) return;
     const d = readSheet(sub, labels);
     if (!d || !d.ok) return;
+    // 分表頁籤名即其圖紙類別（拆分時以類別命名）。把頁籤名納入 scopeCats，
+    // 這樣即使分表的某類別被刪到一列不剩(分表變空)，仍能連動刪掉總表中該類別的列。
+    if (String(nm || '').trim()) scopeCats[String(nm).trim()] = true;
     d.records.forEach(function (r) {
       const cat = String(r['圖紙類別'] || '').trim();
       if (cat) scopeCats[cat] = true;

@@ -24,7 +24,7 @@ from System.Windows import (
     SystemParameters, HorizontalAlignment)
 from System.Windows.Controls import (
     TextBlock, ScrollViewer, ScrollBarVisibility, Grid, RowDefinition,
-    Button)
+    Button, StackPanel)
 from System.Windows.Interop import WindowInteropHelper
 
 from pyrevit import EXEC_PARAMS, DB, revit
@@ -146,14 +146,24 @@ class _NoteWindow(Window):
         Grid.SetRow(sv, 1)
         root.Children.Add(sv)
 
+        # 底部：靜態說明（純顯示，無互動回呼）＋關閉鈕
+        foot = StackPanel()
+        Grid.SetRow(foot, 2)
+        hint = TextBlock()
+        hint.Text = (u"標記已完成：在 Revit「修正備註」把該條最前面加上「已完成」"
+                     u"（多條以「；」分隔）；下次匯出 Google Sheet 後，該條文字會自動反灰。")
+        hint.FontSize = 10
+        hint.TextWrapping = TextWrapping.Wrap
+        hint.Margin = Thickness(0, 8, 0, 6)
+        foot.Children.Add(hint)
+
         close = Button()
         close.Content = u"關閉"
         close.Padding = Thickness(14, 4, 14, 4)
-        close.Margin = Thickness(0, 8, 0, 0)
         close.HorizontalAlignment = HorizontalAlignment.Right
         close.Click += self._on_close
-        Grid.SetRow(close, 2)
-        root.Children.Add(close)
+        foot.Children.Add(close)
+        root.Children.Add(foot)
 
         self.Content = root
         self.Closed += self._on_closed
