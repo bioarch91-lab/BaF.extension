@@ -1967,19 +1967,17 @@ class BatchManageSheetsWindow(Window):
         note = result.get("note") or u""
         if note:
             msg += u"\n⚠ 備註：{}".format(note)
-        # 第二步：選擇是否依「圖紙類別」拆成多個工作表
-        if forms.alert(u"匯出完成。\n\n要再依『圖紙類別』拆成多個工作表嗎？\n"
-                       u"（每個類別一個分頁、以類別命名）",
-                       yes=True, no=True):
-            sres, serr, _ = self._do_split(url, tab)
-            if serr:
-                msg += u"\n\n⚠ 拆分失敗：{}".format(serr)
-            elif sres and sres.get("ok"):
-                made = sres.get("splitTabs") or []
-                msg += (u"\n\n🗂️ 已拆出 {} 個分表：{}".format(len(made), u"、".join(made))
-                        if made else u"\n\n（沒有可拆分的圖紙類別）")
-            else:
-                msg += u"\n\n⚠ 拆分回應異常：{}".format(sres)
+        # 第二步：一律依「圖紙類別」一併更新所有分表（不再詢問），讓總表與分表
+        # 的所有欄位(含修正備註)每次匯出都同步。
+        sres, serr, _ = self._do_split(url, tab)
+        if serr:
+            msg += u"\n\n⚠ 分表更新失敗：{}".format(serr)
+        elif sres and sres.get("ok"):
+            made = sres.get("splitTabs") or []
+            msg += (u"\n\n🗂️ 已一併更新 {} 個分表：{}".format(len(made), u"、".join(made))
+                    if made else u"\n\n（沒有可依圖紙類別拆分的資料）")
+        else:
+            msg += u"\n\n⚠ 分表更新回應異常：{}".format(sres)
         self._show_sync_msg(msg, self.COLOR_SUCCESS)
 
     # ---- 同步分頁：④ 匯入（從 Google Sheet 讀回 + 預覽差異，唯讀不套用）----
@@ -2111,8 +2109,11 @@ class BatchManageSheetsWindow(Window):
             out.append(u"圖號→{}".format(d["num"]))
         if d["name"] and d["name"] != (s.Name or u""):
             out.append(u"圖名→{}".format(d["name"]))
-        for label, val in ((u"圖紙類別", d["cat"]), (u"繪圖員", d["drawer"]),
-                           (u"修正備註", d["note"])):
+        # 修正備註：以 Sheet 為準（含清空）→ 顯示變更，清空標示「(清空)」
+        cur_note = self._read_text_param(s, u"修正備註") or u""
+        if d["note"] != cur_note:
+            out.append(u"修正備註→{}".format(d["note"] if d["note"] else u"(清空)"))
+        for label, val in ((u"圖紙類別", d["cat"]), (u"繪圖員", d["drawer"])):
             if not val:
                 continue
             cur = self._read_text_param(s, label) or u""
@@ -2200,13 +2201,18 @@ class BatchManageSheetsWindow(Window):
             pass
 
     def _needs_edit(self, s, d):
-        # 空白 = 不變更（與「編輯既有」一致，不會清掉既有資料）
+        # 其他欄位：空白 = 不變更（與「編輯既有」一致，不會清掉既有資料）
         if d["num"] and d["num"] != (s.SheetNumber or u""):
             return True
         if d["name"] and d["name"] != (s.Name or u""):
             return True
-        for label, val in ((u"圖紙類別", d["cat"]), (u"繪圖員", d["drawer"]),
-                           (u"修正備註", d["note"])):
+        # 修正備註：以 Google Sheet 為準（含清空）→ 與現值不同即視為變更，
+        # 讓「Sheet 清空 → 移除 Revit 修正備註」也能被偵測到。
+        cur_note = self._read_text_param(s, u"修正備註")
+        cur_note = cur_note if cur_note is not None else u""
+        if d["note"] != cur_note:
+            return True
+        for label, val in ((u"圖紙類別", d["cat"]), (u"繪圖員", d["drawer"])):
             if not val:
                 continue
             cur = self._read_text_param(s, label)
@@ -2249,7 +2255,10 @@ class BatchManageSheetsWindow(Window):
                 "name": unicode(rec.get(u"圖紙名稱") or u""),
                 "cat": unicode(rec.get(u"圖紙類別") or (scope_category or u"")),
                 "drawer": unicode(rec.get(u"繪圖員") or u""),
-                "note": unicode(rec.get(u"修正備註") or u""),
+                # 修正備註：把 Sheet 顯示用的換行正規化回「；」，避免換行寫進 Revit
+                # 參數後明細表只顯示第一行（與匯出時「；→換行」對應）。
+                "note": unicode(rec.get(u"修正備註") or u"").replace(
+                    u"\r\n", u"；").replace(u"\n", u"；").replace(u"\r", u"；"),
                 "real": self._truthy(rec.get(u"是否為Revit出圖")),
                 "extra": dict(batch_extra),
             }
@@ -2753,8 +2762,8 @@ class BatchManageSheetsWindow(Window):
                             self._set_param(sheet, u"圖紙類別", d["cat"])
                         if d["drawer"]:
                             self._set_param(sheet, u"繪圖員", d["drawer"])
-                        if d["note"]:
-                            self._set_param(sheet, u"修正備註", d["note"])
+                        # 修正備註以 Google Sheet 為準（空白＝清空，移除 Revit 的修正備註）
+                        self._set_param(sheet, u"修正備註", d["note"])
                         for k, v in d.get("extra", {}).items():
                             if v:
                                 self._set_param(sheet, k, v)
@@ -4104,7 +4113,7 @@ class _RedpenPreviewWindow(Window):
         bottom.Margin = Thickness(0, 12, 0, 0)
 
         self._sync_chk = CheckBox()
-        self._sync_chk.Content = u"同時同步到 Google Sheet"
+        self._sync_chk.Content = u"同時同步到 Google Sheet（總表＋分表）"
         self._sync_chk.VerticalAlignment = VerticalAlignment.Center
         self._sync_chk.IsChecked = bool(can_sync)
         self._sync_chk.IsEnabled = bool(can_sync)
@@ -4479,12 +4488,26 @@ def main():
                     output.print_md("  - `{}`: {}".format(uid[:8], reason))
 
             if push and ok_n and url and tab:
+                # 先同步總表
                 res, err, _ = win._do_export(url, tab)
                 if err:
-                    output.print_md("\n⚠ 同步 Google Sheet 失敗：{}".format(err))
+                    output.print_md("\n⚠ 同步總表失敗：{}".format(err))
                 elif res and res.get("ok"):
                     output.print_md(
                         "\n🔄 已把含新修正備註的總表同步到 Google Sheet。")
+                    # 再一併重建所有分表（讓分表也帶到新的修正備註）
+                    sres, serr, _ = win._do_split(url, tab)
+                    if serr:
+                        output.print_md("\n⚠ 分表同步失敗：{}".format(serr))
+                    elif sres and sres.get("ok"):
+                        made = sres.get("splitTabs") or []
+                        output.print_md(
+                            "\n🗂️ 已一併更新所有分表（{} 個：{}）。".format(
+                                len(made), u"、".join(made))
+                            if made else
+                            "\n🗂️ 已重建分表（目前沒有可依圖紙類別拆分的資料）。")
+                    else:
+                        output.print_md("\n⚠ 分表同步回應異常：{}".format(sres))
                 else:
                     output.print_md("\n⚠ 同步回應異常：{}".format(res))
             return

@@ -132,6 +132,7 @@ function writeIndexToSheet(sh, records, labels, checkboxLabel, dropdownLabels, u
       const colVals = records.map(function (rec) {
         let v = rec[l];
         if (v === undefined || v === null) v = '';
+        if (l === '修正備註') v = String(v).replace(/；/g, '\n');  // Sheet 內換行顯示
         return [v];
       });
       sh.getRange(dataStart, c, nData, 1).setValues(colVals);
@@ -166,6 +167,10 @@ function writeIndexToSheet(sh, records, labels, checkboxLabel, dropdownLabels, u
 
     // 「已完成」開頭的修正備註條目 → 反灰
     applyDoneGreyByText_(sh, dataStart, records, colOf['修正備註']);
+    // 修正備註欄自動換行，讓「；」轉成的換行能完整顯示
+    if (colOf['修正備註']) {
+      try { sh.getRange(dataStart, colOf['修正備註'], nData, 1).setWrap(true); } catch (eW) {}
+    }
   }
 
   // 更新時間
@@ -195,10 +200,12 @@ function writeIndexToSheet(sh, records, labels, checkboxLabel, dropdownLabels, u
 // 以「；」分隔，凡(去前導空白後)以「已完成」開頭的條目塗灰(#999)，其餘明確設黑字(#000)。
 // 明確設黑 → 在 Sheet 編輯時可把舊的灰字「重設」成黑字(新內容與舊內容可區分)。
 function _noteRich_(full) {
+  // 顯示用：把「；」轉成儲存格內換行（Google Sheet 檢視較友善）；依換行切條判斷反灰。
+  var disp = String(full == null ? '' : full).replace(/；/g, '\n');
   var black = SpreadsheetApp.newTextStyle().setForegroundColor('#000000').build();
   var grey = SpreadsheetApp.newTextStyle().setForegroundColor('#999999').build();
-  var rich = SpreadsheetApp.newRichTextValue().setText(full).setTextStyle(black);
-  var parts = full.split('；');
+  var rich = SpreadsheetApp.newRichTextValue().setText(disp).setTextStyle(black);
+  var parts = disp.split('\n');
   var pos = 0;
   for (var j = 0; j < parts.length; j++) {
     var seg = parts[j];
@@ -206,7 +213,7 @@ function _noteRich_(full) {
     if (segEnd > segStart && seg.replace(/^\s+/, '').indexOf('已完成') === 0) {
       rich.setTextStyle(segStart, segEnd, grey);
     }
-    pos = segEnd + 1;   // +1 跳過分隔符「；」
+    pos = segEnd + 1;   // 換行符為 1 字元
   }
   return rich.build();
 }
@@ -352,7 +359,9 @@ function writeSubSheet(sh, records, labels, checkboxLabel, dropdownLabels, updat
     labels.forEach(function (l) {
       const c = colOf[l];
       const colVals = records.map(function (rec) {
-        let v = rec[l]; if (v === undefined || v === null) v = ''; return [v];
+        let v = rec[l]; if (v === undefined || v === null) v = '';
+        if (l === '修正備註') v = String(v).replace(/；/g, '\n');  // Sheet 內換行顯示
+        return [v];
       });
       sh.getRange(dataStart, c, nData, 1).setValues(colVals);
     });
@@ -382,6 +391,10 @@ function writeSubSheet(sh, records, labels, checkboxLabel, dropdownLabels, updat
 
     // 「已完成」開頭的修正備註條目 → 反灰
     applyDoneGreyByText_(sh, dataStart, records, colOf['修正備註']);
+    // 修正備註欄自動換行，讓「；」轉成的換行能完整顯示
+    if (colOf['修正備註']) {
+      try { sh.getRange(dataStart, colOf['修正備註'], nData, 1).setWrap(true); } catch (eW) {}
+    }
   }
 
   // 凍結到欄位表頭列（更新時間＋批次參數＋欄位表頭都算表頭）
@@ -428,6 +441,10 @@ function readSheet(sh, labels) {
         const c = colOf[l];
         rec[l] = c ? row[c - 1] : '';
       });
+      // 修正備註：Sheet 內以換行顯示 → 回 Revit 前轉回「；」(Revit 明細表單行友善)
+      if (rec['修正備註'] != null) {
+        rec['修正備註'] = String(rec['修正備註']).replace(/\r?\n/g, '；');
+      }
       const u = String(rec['UID'] || '').trim();
       const num = String(rec['圖紙號碼'] || '').trim();
       const nm = String(rec['圖紙名稱'] || '').trim();
