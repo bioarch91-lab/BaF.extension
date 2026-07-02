@@ -1,0 +1,29 @@
+<Page xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+      xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+      Background="White">
+  <Grid Margin="10">
+    <Grid.RowDefinitions>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="*"/>
+      <RowDefinition Height="Auto"/>
+    </Grid.RowDefinitions>
+    <Border Grid.Row="0" Background="#FFF3E0" BorderBrush="#FFB74D" BorderThickness="1"
+            CornerRadius="4" Padding="6,3" Margin="0,0,0,6">
+      <TextBlock Text="【開發中】顯示功能可用；勾選完成／回覆的儲存仍在測試"
+                 FontSize="12" Foreground="#E65100" TextWrapping="Wrap"/>
+    </Border>
+    <TextBlock x:Name="HeadText" Grid.Row="1" FontWeight="Bold" FontSize="16"
+               TextWrapping="Wrap" Margin="0,0,0,8"/>
+    <ScrollViewer Grid.Row="2" VerticalScrollBarVisibility="Auto"
+                  HorizontalScrollBarVisibility="Disabled">
+      <StackPanel x:Name="ItemsPanel"/>
+    </ScrollViewer>
+    <StackPanel Grid.Row="3" Margin="0,8,0,0">
+      <TextBlock x:Name="StatusText" FontSize="12" TextWrapping="Wrap"
+                 Margin="0,0,0,4"/>
+      <Button x:Name="SaveButton" Content="儲存" HorizontalAlignment="Right"
+              Padding="16,4"/>
+    </StackPanel>
+  </Grid>
+</Page>

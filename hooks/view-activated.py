@@ -18,7 +18,6 @@ clr.AddReference("PresentationCore")
 clr.AddReference("WindowsBase")
 
 from System import AppDomain, IntPtr
-from System.Diagnostics import Process
 from System.Windows import (
     Window, Thickness, WindowStartupLocation, TextWrapping, FontWeights,
     SystemParameters, HorizontalAlignment)
@@ -27,7 +26,9 @@ from System.Windows.Controls import (
     Button, StackPanel)
 from System.Windows.Interop import WindowInteropHelper
 
-from pyrevit import EXEC_PARAMS, DB, revit
+# 注意：不要用 System.Diagnostics.Process —— 在 Revit 2025(.NET 8/CoreCLR)它在
+# 未預設載入的 System.Diagnostics.Process.dll，會 ImportError。改用 Revit 主視窗把手。
+from pyrevit import EXEC_PARAMS, DB, revit, HOST_APP
 
 NOTE_PARAM = u"修正備註"
 OPEN_KEY = "BAF_RedpenOpenViewIds"   # 上次「目前開啟的視圖」集合（逗號字串）
@@ -107,8 +108,8 @@ def _set_prev_ids(ids):
 class _NoteWindow(Window):
     def __init__(self, num, name, body):
         self.Title = (u"修正備註　{}　{}".format(num, name)).strip()
-        self.Width = 380
-        self.Height = 260
+        self.Width = 480
+        self.Height = 330
         self.ShowInTaskbar = False
         self.WindowStartupLocation = WindowStartupLocation.Manual
         try:
@@ -130,7 +131,7 @@ class _NoteWindow(Window):
         head = TextBlock()
         head.Text = u"{}　{}".format(num, name).strip()
         head.FontWeight = FontWeights.Bold
-        head.FontSize = 13
+        head.FontSize = 18
         head.TextWrapping = TextWrapping.Wrap
         head.Margin = Thickness(0, 0, 0, 8)
         Grid.SetRow(head, 0)
@@ -140,7 +141,7 @@ class _NoteWindow(Window):
         sv.VerticalScrollBarVisibility = ScrollBarVisibility.Auto
         txt = TextBlock()
         txt.Text = body
-        txt.FontSize = 12
+        txt.FontSize = 16
         txt.TextWrapping = TextWrapping.Wrap
         sv.Content = txt
         Grid.SetRow(sv, 1)
@@ -152,7 +153,7 @@ class _NoteWindow(Window):
         hint = TextBlock()
         hint.Text = (u"標記已完成：在 Revit「修正備註」把該條最前面加上「已完成」"
                      u"（多條以「；」分隔）；下次匯出 Google Sheet 後，該條文字會自動反灰。")
-        hint.FontSize = 10
+        hint.FontSize = 14
         hint.TextWrapping = TextWrapping.Wrap
         hint.Margin = Thickness(0, 8, 0, 6)
         foot.Children.Add(hint)
@@ -200,9 +201,11 @@ def _show_note_window(sheet, note):
 
     win = _NoteWindow(sheet.SheetNumber or u"", sheet.Name or u"",
                       _format_note(note))
-    # 以 Revit 主視窗為 Owner → 浮在 Revit 上方但「不阻擋」操作（modeless）
+    # 以 Revit 主視窗為 Owner → 浮在 Revit 上方但「不阻擋」操作（modeless）。
+    # 用 UIApplication.MainWindowHandle(Revit 2019+)，避免用 System.Diagnostics.Process
+    # (在 Revit 2025/.NET 8 會匯入失敗)。
     try:
-        h = Process.GetCurrentProcess().MainWindowHandle
+        h = HOST_APP.uiapp.MainWindowHandle
         if h != IntPtr.Zero:
             WindowInteropHelper(win).Owner = h
     except Exception:
